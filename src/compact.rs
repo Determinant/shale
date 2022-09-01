@@ -308,7 +308,7 @@ impl CompactSpaceInner {
         self.header
             .meta_space_tail
             .write(|r| **r -= desc_size, true, wctx);
-        if desc_addr.addr + desc_size != **self.header.meta_space_tail {
+        if desc_addr.addr != **self.header.meta_space_tail {
             let desc_last = self.get_descriptor(unsafe {
                 ObjPtr::new_from_addr(**self.header.meta_space_tail)
             })?;
@@ -461,7 +461,7 @@ impl CompactSpaceInner {
         }
 
         let hsize = CompactHeader::MSIZE;
-        let fsize = CompactHeader::MSIZE;
+        let fsize = CompactFooter::MSIZE;
         let dsize = CompactDescriptor::MSIZE;
 
         let mut old_alloc_addr = *self.header.alloc_addr;
@@ -488,7 +488,8 @@ impl CompactSpaceInner {
                         ObjPtr::new(desc_haddr),
                         CompactHeader::MSIZE,
                     )?;
-                    assert!(header.payload_size == desc_payload_size);
+                    assert_eq!(header.payload_size, desc_payload_size);
+                    assert!(header.is_freed);
                     header.write(|h| h.is_freed = false, true, wctx);
                 }
                 self.del_desc(ptr, wctx)?;
@@ -501,6 +502,7 @@ impl CompactSpaceInner {
                         CompactHeader::MSIZE,
                     )?;
                     assert_eq!(lheader.payload_size, desc_payload_size);
+                    assert!(lheader.is_freed);
                     lheader.write(
                         |h| {
                             h.is_freed = false;
@@ -676,7 +678,6 @@ impl ShaleStore for CompactSpace {
     fn free_item<T: MummyItem>(
         &mut self, item: ObjPtr<T>, wctx: &WriteContext,
     ) -> Result<(), ShaleError> {
-        println!("free_item");
         self.inner.get_mut().free(item.addr(), wctx)
     }
 
