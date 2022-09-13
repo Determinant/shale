@@ -20,6 +20,7 @@ enum MemRollback {
 }
 
 pub type SpaceID = u8;
+pub const INVALID_SPACE_ID: SpaceID = 0xff;
 
 pub struct DiskWrite {
     pub space_id: SpaceID,
