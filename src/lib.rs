@@ -46,8 +46,8 @@ impl std::fmt::Debug for DiskWrite {
 /// addressing information (and is thus read-only) and just represents the decoded/mapped data.
 /// This should be implemented as part of [ShaleRefConverter::into_shale_ref].
 pub trait ShaleRef<T: ?Sized>: Deref<Target = T> {
-    /// Access it as a [LinearRef] object.
-    fn as_linear_ref(&self) -> &dyn LinearRef;
+    /// Access it as a [MemView] object.
+    fn as_linear_ref(&self) -> &dyn MemView;
     /// Defines how the current in-memory object of `T` should be represented in the linear storage space.
     fn to_mem_image(&self) -> Option<Box<[u8]>>;
     /// Write to the typed content.
@@ -58,7 +58,7 @@ pub trait ShaleRef<T: ?Sized>: Deref<Target = T> {
 }
 
 /// A handle that pins a portion of the linear memory image.
-pub trait LinearRef: Deref<Target = [u8]> {
+pub trait MemView: Deref<Target = [u8]> {
     /// Returns the underlying linear in-memory store.
     fn mem_image(&self) -> Box<dyn MemStore>;
 }
@@ -70,9 +70,9 @@ pub trait LinearRef: Deref<Target = [u8]> {
 pub trait MemStore {
     /// Returns a handle that pins the `length` of bytes starting from `offset` and makes them
     /// directly accessible.
-    fn get_ref(&self, offset: u64, length: u64) -> Option<Box<dyn LinearRef>>;
+    fn get_ref(&self, offset: u64, length: u64) -> Option<Box<dyn MemView>>;
     /// Write the `change` to the portion of the linear space starting at `offset`. The change
-    /// should be immediately visible to all `LinearRef` associated to this linear space.
+    /// should be immediately visible to all `MemView` associated to this linear space.
     fn write(&self, offset: u64, change: &[u8]);
     /// Returns the identifier of this storage space.
     fn id(&self) -> SpaceID;
@@ -289,7 +289,7 @@ pub trait MummyItem {
 /// be used in most of the circumstances.
 pub struct MummyRef<T> {
     decoded: T,
-    raw: Box<dyn LinearRef>,
+    raw: Box<dyn MemView>,
     len_limit: u64,
 }
 
@@ -301,7 +301,7 @@ impl<T> Deref for MummyRef<T> {
 }
 
 impl<T: MummyItem> ShaleRef<T> for MummyRef<T> {
-    fn as_linear_ref(&self) -> &dyn LinearRef {
+    fn as_linear_ref(&self) -> &dyn MemView {
         &*self.raw
     }
     fn to_mem_image(&self) -> Option<Box<[u8]>> {
@@ -420,7 +420,7 @@ impl PlainMem {
 }
 
 impl MemStore for PlainMem {
-    fn get_ref(&self, offset: u64, length: u64) -> Option<Box<dyn LinearRef>> {
+    fn get_ref(&self, offset: u64, length: u64) -> Option<Box<dyn MemView>> {
         let offset = offset as usize;
         let length = length as usize;
         if offset + length > self.get_space_mut().len() {
@@ -458,7 +458,7 @@ impl Deref for PlainMemRef {
     }
 }
 
-impl LinearRef for PlainMemRef {
+impl MemView for PlainMemRef {
     fn mem_image(&self) -> Box<dyn MemStore> {
         Box::new(self.mem.clone())
     }
