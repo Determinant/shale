@@ -2,7 +2,7 @@ pub mod block;
 pub mod compact;
 mod util;
 
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -12,11 +12,6 @@ use std::rc::Rc;
 pub enum ShaleError {
     LinearMemStoreError,
     DecodeError,
-}
-
-enum MemRollback {
-    Rollback(Box<[u8]>),
-    NoRollback,
 }
 
 pub type SpaceID = u8;
@@ -60,7 +55,7 @@ pub trait ShaleRef<T: ?Sized>: Deref<Target = T> {
 /// A handle that pins a portion of the linear memory image.
 pub trait MemView: Deref<Target = [u8]> {
     /// Returns the underlying linear in-memory store.
-    fn mem_image(&self) -> Box<dyn MemStore>;
+    fn mem_image(&self) -> &dyn MemStore;
 }
 
 /// In-memory store that offers access for intervals from a linear byte space, which is usually
@@ -79,43 +74,6 @@ pub trait MemStore {
     ///// Grows the space by a specified number of bytes and returns the original size. Use 0 to get
     ///// the current size.
     //fn grow(&self, extra: u64) -> u64;
-}
-
-/// Records a context of changes made to the [ShaleStore].
-pub struct WriteContext {
-    writes: RefCell<Vec<(DiskWrite, MemRollback, Box<dyn MemStore>)>>,
-}
-
-impl WriteContext {
-    pub fn new() -> Self {
-        Self {
-            writes: RefCell::new(Vec::new()),
-        }
-    }
-
-    fn add(&self, dw: DiskWrite, mw: MemRollback, mem: Box<dyn MemStore>) {
-        self.writes.borrow_mut().push((dw, mw, mem))
-    }
-
-    /// Returns an atomic group of writes that should be done by a persistent store to make
-    /// in-memory change persistent. Each write is made to one logic linear space specified
-    /// by `space_id`. The `data` should be written from `space_off` in that linear space.
-    pub fn commit(self) -> Vec<DiskWrite> {
-        self.writes
-            .into_inner()
-            .into_iter()
-            .map(|(dw, _, _)| dw)
-            .collect()
-    }
-
-    /// Abort all changes.
-    pub fn abort(self) {
-        for (dw, mw, mem) in self.writes.into_inner() {
-            if let MemRollback::Rollback(r) = mw {
-                mem.write(dw.space_off, &r);
-            }
-        }
-    }
 }
 
 /// Opaque typed pointer in the 64-bit virtual addressable space.
@@ -204,15 +162,7 @@ impl<'a, T: ?Sized> ObjRef<'a, T> {
 
 impl<'a, T: ?Sized> ObjRef<'a, T> {
     /// Write to the underlying object. Returns `Some(())` on success.
-    pub fn write(
-        &mut self, modify: impl FnOnce(&mut T) -> (), mem_rollback: bool,
-        wctx: &WriteContext,
-    ) -> Option<()> {
-        let mw = if mem_rollback {
-            MemRollback::Rollback(self.inner.to_mem_image()?)
-        } else {
-            MemRollback::NoRollback
-        };
+    pub fn write(&mut self, modify: impl FnOnce(&mut T) -> ()) -> Option<()> {
         modify(self.inner.write());
         let lspace = self.inner.as_linear_ref().mem_image();
         let new_value = self.inner.to_mem_image()?;
@@ -222,12 +172,6 @@ impl<'a, T: ?Sized> ObjRef<'a, T> {
         if new_value.len() == 0 {
             return Some(())
         }
-        let dw = DiskWrite {
-            space_off: self.addr_,
-            space_id: self.space_id,
-            data: new_value,
-        };
-        wctx.add(dw, mw, lspace);
         Some(())
     }
 
@@ -262,11 +206,11 @@ pub trait ShaleStore {
     ) -> Result<ObjRef<'a, T>, ShaleError>;
     /// Allocate a new item.
     fn put_item<'a, T: MummyItem + 'a>(
-        &'a self, item: T, extra: u64, wctx: &WriteContext,
+        &'a self, item: T, extra: u64,
     ) -> Result<ObjRef<'a, T>, ShaleError>;
     /// Free a item and recycle its space when applicable.
     fn free_item<T: MummyItem>(
-        &mut self, item: ObjPtr<T>, wctx: &WriteContext,
+        &mut self, item: ObjPtr<T>,
     ) -> Result<(), ShaleError>;
 }
 
@@ -321,7 +265,9 @@ impl<T: MummyItem> ShaleRef<T> for MummyRef<T> {
 }
 
 impl<T: MummyItem> MummyRef<T> {
-    fn new(addr: u64, len_limit: u64, space: &dyn MemStore) -> Result<Self, ShaleError> {
+    fn new(
+        addr: u64, len_limit: u64, space: &dyn MemStore,
+    ) -> Result<Self, ShaleError> {
         let (length, decoded) = T::hydrate(addr, space)?;
         Ok(Self {
             decoded,
@@ -368,7 +314,7 @@ impl<T> MummyRef<T> {
             length,
             length,
             decoded,
-            s.inner.as_linear_ref().mem_image().as_ref(),
+            s.inner.as_linear_ref().mem_image(),
         )?);
         Ok(ObjRef {
             addr_,
@@ -459,8 +405,8 @@ impl Deref for PlainMemRef {
 }
 
 impl MemView for PlainMemRef {
-    fn mem_image(&self) -> Box<dyn MemStore> {
-        Box::new(self.mem.clone())
+    fn mem_image(&self) -> &dyn MemStore {
+        &self.mem
     }
 }
 
@@ -476,18 +422,13 @@ pub unsafe fn get_obj_ref<'a, T: 'a + MummyItem>(
 }
 
 pub unsafe fn obj_ref_from_item<'a, T: 'a + MummyItem>(
-    store: &'a dyn MemStore, addr: u64, length: u64, len_limit: u64,
-    decoded: T,
+    store: &'a dyn MemStore, addr: u64, length: u64, len_limit: u64, decoded: T,
 ) -> Result<ObjRef<'a, T>, ShaleError> {
     Ok(ObjRef::from_shale(
         addr,
         store.id(),
         Box::new(MummyRef::from_hydrated(
-            addr,
-            length,
-            len_limit,
-            decoded,
-            store,
+            addr, length, len_limit, decoded, store,
         )?),
     ))
 }

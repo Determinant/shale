@@ -1,6 +1,5 @@
 use super::{
     MemStore, MummyItem, MummyRef, ObjPtr, ObjRef, ShaleError, ShaleStore,
-    WriteContext,
 };
 use std::cell::UnsafeCell;
 use std::rc::Rc;
@@ -289,26 +288,30 @@ impl CompactSpaceInner {
         &'a self, ptr: ObjPtr<CompactDescriptor>,
     ) -> Result<ObjRef<'a, CompactDescriptor>, ShaleError> {
         unsafe {
-            super::get_obj_ref(self.meta_space.as_ref(), ptr, CompactDescriptor::MSIZE)
+            super::get_obj_ref(
+                self.meta_space.as_ref(),
+                ptr,
+                CompactDescriptor::MSIZE,
+            )
         }
     }
 
     fn get_data_ref<'a, T: MummyItem + 'a>(
         &'a self, ptr: ObjPtr<T>, len_limit: u64,
     ) -> Result<ObjRef<'a, T>, ShaleError> {
-        unsafe { super::get_obj_ref(self.compact_space.as_ref(), ptr, len_limit) }
+        unsafe {
+            super::get_obj_ref(self.compact_space.as_ref(), ptr, len_limit)
+        }
     }
 
     fn del_desc(
-        &mut self, desc_addr: ObjPtr<CompactDescriptor>, wctx: &WriteContext,
+        &mut self, desc_addr: ObjPtr<CompactDescriptor>,
     ) -> Result<(), ShaleError> {
         let desc_size = CompactDescriptor::MSIZE;
         debug_assert!(
             (desc_addr.addr - self.header.base_addr.addr) % desc_size == 0
         );
-        self.header
-            .meta_space_tail
-            .write(|r| **r -= desc_size, true, wctx);
+        self.header.meta_space_tail.write(|r| **r -= desc_size);
         if desc_addr.addr != **self.header.meta_space_tail {
             let desc_last = self.get_descriptor(unsafe {
                 ObjPtr::new_from_addr(**self.header.meta_space_tail)
@@ -316,31 +319,25 @@ impl CompactSpaceInner {
             let mut desc = self.get_descriptor(unsafe {
                 ObjPtr::new_from_addr(desc_addr.addr)
             })?;
-            desc.write(|r| *r = *desc_last, true, wctx);
+            desc.write(|r| *r = *desc_last);
             let mut header = self.get_data_ref::<CompactHeader>(
                 ObjPtr::new(desc.haddr),
                 CompactHeader::MSIZE,
             )?;
-            header.write(|h| h.desc_addr = desc_addr, true, wctx);
+            header.write(|h| h.desc_addr = desc_addr);
         }
         Ok(())
     }
 
-    fn new_desc(
-        &mut self, wctx: &WriteContext,
-    ) -> Result<ObjPtr<CompactDescriptor>, ShaleError> {
+    fn new_desc(&mut self) -> Result<ObjPtr<CompactDescriptor>, ShaleError> {
         let addr = **self.header.meta_space_tail;
-        self.header.meta_space_tail.write(
-            |r| **r += CompactDescriptor::MSIZE,
-            true,
-            wctx,
-        );
+        self.header
+            .meta_space_tail
+            .write(|r| **r += CompactDescriptor::MSIZE);
         Ok(unsafe { ObjPtr::new_from_addr(addr) })
     }
 
-    fn free(
-        &mut self, addr: u64, wctx: &WriteContext,
-    ) -> Result<(), ShaleError> {
+    fn free(&mut self, addr: u64) -> Result<(), ShaleError> {
         let hsize = CompactHeader::MSIZE;
         let fsize = CompactFooter::MSIZE;
         let regn_size = 1 << self.regn_nbit;
@@ -381,7 +378,7 @@ impl CompactSpaceInner {
             if pheader_is_freed {
                 h = offset;
                 payload_size += hsize + fsize + pheader_payload_size;
-                self.del_desc(pheader_desc_addr, wctx)?;
+                self.del_desc(pheader_desc_addr)?;
             }
         }
 
@@ -416,21 +413,17 @@ impl CompactSpaceInner {
                     assert!(nheader_payload_size == nfooter.payload_size);
                 }
                 payload_size += hsize + fsize + nheader_payload_size;
-                self.del_desc(nheader_desc_addr, wctx)?;
+                self.del_desc(nheader_desc_addr)?;
             }
         }
 
-        let desc_addr = self.new_desc(wctx)?;
+        let desc_addr = self.new_desc()?;
         {
             let mut desc = self.get_descriptor(desc_addr)?;
-            desc.write(
-                |d| {
-                    d.payload_size = payload_size;
-                    d.haddr = h;
-                },
-                true,
-                wctx,
-            );
+            desc.write(|d| {
+                d.payload_size = payload_size;
+                d.haddr = h;
+            });
         }
         let mut h = self.get_data_ref::<CompactHeader>(
             ObjPtr::new(h),
@@ -440,21 +433,17 @@ impl CompactSpaceInner {
             ObjPtr::new(f),
             CompactFooter::MSIZE,
         )?;
-        h.write(
-            |h| {
-                h.payload_size = payload_size;
-                h.is_freed = true;
-                h.desc_addr = desc_addr;
-            },
-            true,
-            wctx,
-        );
-        f.write(|f| f.payload_size = payload_size, true, wctx);
+        h.write(|h| {
+            h.payload_size = payload_size;
+            h.is_freed = true;
+            h.desc_addr = desc_addr;
+        });
+        f.write(|f| f.payload_size = payload_size);
         Ok(())
     }
 
     fn alloc_from_freed(
-        &mut self, length: u64, wctx: &WriteContext,
+        &mut self, length: u64,
     ) -> Result<Option<u64>, ShaleError> {
         let tail = **self.header.meta_space_tail;
         if tail == self.header.base_addr.addr {
@@ -491,9 +480,9 @@ impl CompactSpaceInner {
                     )?;
                     assert_eq!(header.payload_size, desc_payload_size);
                     assert!(header.is_freed);
-                    header.write(|h| h.is_freed = false, true, wctx);
+                    header.write(|h| h.is_freed = false);
                 }
-                self.del_desc(ptr, wctx)?;
+                self.del_desc(ptr)?;
                 true
             } else if desc_payload_size > length + hsize + fsize {
                 // able to split
@@ -504,14 +493,10 @@ impl CompactSpaceInner {
                     )?;
                     assert_eq!(lheader.payload_size, desc_payload_size);
                     assert!(lheader.is_freed);
-                    lheader.write(
-                        |h| {
-                            h.is_freed = false;
-                            h.payload_size = length;
-                        },
-                        true,
-                        wctx,
-                    );
+                    lheader.write(|h| {
+                        h.is_freed = false;
+                        h.payload_size = length;
+                    });
                 }
                 {
                     let mut lfooter = self.get_data_ref::<CompactFooter>(
@@ -519,56 +504,44 @@ impl CompactSpaceInner {
                         CompactFooter::MSIZE,
                     )?;
                     //assert!(lfooter.payload_size == desc_payload_size);
-                    lfooter.write(|f| f.payload_size = length, true, wctx);
+                    lfooter.write(|f| f.payload_size = length);
                 }
 
                 let offset = desc_haddr + hsize + length + fsize;
                 let rpayload_size = desc_payload_size - length - fsize - hsize;
-                let rdesc_addr = self.new_desc(wctx)?;
+                let rdesc_addr = self.new_desc()?;
                 {
                     let mut rdesc = self.get_descriptor(rdesc_addr)?;
-                    rdesc.write(
-                        |rd| {
-                            rd.payload_size = rpayload_size;
-                            rd.haddr = offset;
-                        },
-                        true,
-                        wctx,
-                    );
+                    rdesc.write(|rd| {
+                        rd.payload_size = rpayload_size;
+                        rd.haddr = offset;
+                    });
                 }
                 {
                     let mut rheader = self.get_data_ref::<CompactHeader>(
                         ObjPtr::new(offset),
                         CompactHeader::MSIZE,
                     )?;
-                    rheader.write(
-                        |rh| {
-                            rh.is_freed = true;
-                            rh.payload_size = rpayload_size;
-                            rh.desc_addr = rdesc_addr;
-                        },
-                        true,
-                        wctx,
-                    );
+                    rheader.write(|rh| {
+                        rh.is_freed = true;
+                        rh.payload_size = rpayload_size;
+                        rh.desc_addr = rdesc_addr;
+                    });
                 }
                 {
                     let mut rfooter = self.get_data_ref::<CompactFooter>(
                         ObjPtr::new(offset + hsize + rpayload_size),
                         CompactFooter::MSIZE,
                     )?;
-                    rfooter.write(
-                        |f| f.payload_size = rpayload_size,
-                        true,
-                        wctx,
-                    );
+                    rfooter.write(|f| f.payload_size = rpayload_size);
                 }
-                self.del_desc(ptr, wctx)?;
+                self.del_desc(ptr)?;
                 true
             } else {
                 false
             };
             if exit {
-                self.header.alloc_addr.write(|r| *r = ptr, true, wctx);
+                self.header.alloc_addr.write(|r| *r = ptr);
                 res = Some(desc_haddr + hsize);
                 break
             }
@@ -583,25 +556,19 @@ impl CompactSpaceInner {
         Ok(res)
     }
 
-    fn alloc_new(
-        &mut self, length: u64, wctx: &WriteContext,
-    ) -> Result<u64, ShaleError> {
+    fn alloc_new(&mut self, length: u64) -> Result<u64, ShaleError> {
         let offset = **self.header.compact_space_tail;
         let regn_size = 1 << self.regn_nbit;
         let mut total_length =
             CompactHeader::MSIZE + length + CompactFooter::MSIZE;
-        self.header.compact_space_tail.write(
-            |r| {
-                // an item is always fully in one region
-                let rem = regn_size - (offset & (regn_size - 1));
-                if rem < total_length {
-                    total_length += rem
-                }
-                **r += total_length
-            },
-            true,
-            wctx,
-        );
+        self.header.compact_space_tail.write(|r| {
+            // an item is always fully in one region
+            let rem = regn_size - (offset & (regn_size - 1));
+            if rem < total_length {
+                total_length += rem
+            }
+            **r += total_length
+        });
         let mut h = self.get_data_ref::<CompactHeader>(
             ObjPtr::new(offset),
             CompactHeader::MSIZE,
@@ -610,16 +577,12 @@ impl CompactSpaceInner {
             ObjPtr::new(offset + CompactHeader::MSIZE + length),
             CompactFooter::MSIZE,
         )?;
-        h.write(
-            |h| {
-                h.payload_size = length;
-                h.is_freed = false;
-                h.desc_addr = ObjPtr::new(0);
-            },
-            true,
-            wctx,
-        );
-        f.write(|f| f.payload_size = length, true, wctx);
+        h.write(|h| {
+            h.payload_size = length;
+            h.is_freed = false;
+            h.desc_addr = ObjPtr::new(0);
+        });
+        f.write(|f| f.payload_size = length);
         Ok(offset + CompactHeader::MSIZE)
     }
 }
@@ -649,17 +612,17 @@ impl CompactSpace {
 
 impl ShaleStore for CompactSpace {
     fn put_item<'a, T: MummyItem + 'a>(
-        &'a self, item: T, extra: u64, wctx: &WriteContext,
+        &'a self, item: T, extra: u64,
     ) -> Result<ObjRef<'a, T>, ShaleError> {
         let bytes = item.dehydrate();
         let size = bytes.len() as u64 + extra;
         let inner = unsafe { &mut *self.inner.get() };
         let ptr: ObjPtr<T> = unsafe {
             ObjPtr::new_from_addr(
-                if let Some(addr) = inner.alloc_from_freed(size, wctx)? {
+                if let Some(addr) = inner.alloc_from_freed(size)? {
                     addr
                 } else {
-                    inner.alloc_new(size, wctx)?
+                    inner.alloc_new(size)?
                 },
             )
         };
@@ -672,14 +635,14 @@ impl ShaleStore for CompactSpace {
                 item,
             )?
         };
-        u.write(|_| {}, true, wctx);
+        u.write(|_| {});
         Ok(u)
     }
 
     fn free_item<T: MummyItem>(
-        &mut self, item: ObjPtr<T>, wctx: &WriteContext,
+        &mut self, item: ObjPtr<T>,
     ) -> Result<(), ShaleError> {
-        self.inner.get_mut().free(item.addr(), wctx)
+        self.inner.get_mut().free(item.addr())
     }
 
     fn get_item<'a, T: MummyItem + 'a>(
