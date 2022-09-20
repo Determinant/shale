@@ -1,6 +1,6 @@
 pub mod block;
 pub mod compact;
-mod util;
+pub mod util;
 
 use std::cell::UnsafeCell;
 use std::fmt;
