@@ -3,6 +3,7 @@ use super::{
     WriteContext,
 };
 use std::cell::UnsafeCell;
+use std::rc::Rc;
 
 pub struct CompactHeader {
     payload_size: u64,
@@ -276,8 +277,8 @@ impl std::ops::DerefMut for U64Field {
 }
 
 struct CompactSpaceInner {
-    meta_space: Box<dyn MemStore>,
-    compact_space: Box<dyn MemStore>,
+    meta_space: Rc<dyn MemStore>,
+    compact_space: Rc<dyn MemStore>,
     header: CompactSpaceHeaderSliced<'static>,
     alloc_max_walk: u64,
     regn_nbit: u64,
@@ -288,14 +289,14 @@ impl CompactSpaceInner {
         &'a self, ptr: ObjPtr<CompactDescriptor>,
     ) -> Result<ObjRef<'a, CompactDescriptor>, ShaleError> {
         unsafe {
-            super::get_obj_ref(&self.meta_space, ptr, CompactDescriptor::MSIZE)
+            super::get_obj_ref(self.meta_space.as_ref(), ptr, CompactDescriptor::MSIZE)
         }
     }
 
     fn get_data_ref<'a, T: MummyItem + 'a>(
         &'a self, ptr: ObjPtr<T>, len_limit: u64,
     ) -> Result<ObjRef<'a, T>, ShaleError> {
-        unsafe { super::get_obj_ref(&self.compact_space, ptr, len_limit) }
+        unsafe { super::get_obj_ref(self.compact_space.as_ref(), ptr, len_limit) }
     }
 
     fn del_desc(
@@ -629,7 +630,7 @@ pub struct CompactSpace {
 
 impl CompactSpace {
     pub fn new(
-        meta_space: Box<dyn MemStore>, compact_space: Box<dyn MemStore>,
+        meta_space: Rc<dyn MemStore>, compact_space: Rc<dyn MemStore>,
         header: ObjRef<'static, CompactSpaceHeader>, alloc_max_walk: u64,
         regn_nbit: u64,
     ) -> Result<Self, ShaleError> {
@@ -664,7 +665,7 @@ impl ShaleStore for CompactSpace {
         };
         let mut u: ObjRef<T> = unsafe {
             super::obj_ref_from_item(
-                &inner.compact_space,
+                inner.compact_space.as_ref(),
                 ptr.addr(),
                 size,
                 size,

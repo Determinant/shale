@@ -465,18 +465,18 @@ impl MemView for PlainMemRef {
 }
 
 pub unsafe fn get_obj_ref<'a, T: 'a + MummyItem>(
-    store: &'a Box<dyn MemStore>, ptr: ObjPtr<T>, len_limit: u64,
+    store: &'a dyn MemStore, ptr: ObjPtr<T>, len_limit: u64,
 ) -> Result<ObjRef<'a, T>, ShaleError> {
     let addr = ptr.addr();
     Ok(ObjRef::from_shale(
         addr,
         store.id(),
-        Box::new(MummyRef::new(addr, len_limit, store.as_ref())?),
+        Box::new(MummyRef::new(addr, len_limit, store)?),
     ))
 }
 
 pub unsafe fn obj_ref_from_item<'a, T: 'a + MummyItem>(
-    store: &'a Box<dyn MemStore>, addr: u64, length: u64, len_limit: u64,
+    store: &'a dyn MemStore, addr: u64, length: u64, len_limit: u64,
     decoded: T,
 ) -> Result<ObjRef<'a, T>, ShaleError> {
     Ok(ObjRef::from_shale(
@@ -487,7 +487,7 @@ pub unsafe fn obj_ref_from_item<'a, T: 'a + MummyItem>(
             length,
             len_limit,
             decoded,
-            store.as_ref(),
+            store,
         )?),
     ))
 }
