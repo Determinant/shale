@@ -1,12 +1,13 @@
-pub mod block;
-pub mod compact;
-pub mod util;
-
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::rc::Rc;
+
+pub mod block;
+pub mod compact;
+pub mod util;
 
 #[derive(Debug)]
 pub enum ShaleError {
@@ -38,20 +39,20 @@ impl std::fmt::Debug for DiskWrite {
     }
 }
 
-/// A handle that pins a portion of the linear memory image.
+/// A handle that pins and provides a readable access to a portion of the linear memory image.
 pub trait MemView: Deref<Target = [u8]> {
     /// Returns the underlying linear in-memory store.
     fn mem_image(&self) -> &dyn MemStore;
 }
 
-/// In-memory store that offers access for intervals from a linear byte space, which is usually
-/// backed by a cached/memory-mapped pool of the accessed intervals from its underlying linear
-/// persistent store. Reads could trigger disk reads, but writes will *only* be visible in memory
-/// (it does not write back to the disk).
+/// In-memory store that offers access to intervals from a linear byte space, which is usually
+/// backed by a cached/memory-mapped pool of the accessed intervals from the underlying linear
+/// persistent store. Reads could trigger disk reads to bring data into memory, but writes will
+/// *only* be visible in memory (it does not write back to the disk).
 pub trait MemStore {
     /// Returns a handle that pins the `length` of bytes starting from `offset` and makes them
     /// directly accessible.
-    fn get_ref(&self, offset: u64, length: u64) -> Option<Box<dyn MemView>>;
+    fn get_view(&self, offset: u64, length: u64) -> Option<Box<dyn MemView>>;
     /// Write the `change` to the portion of the linear space starting at `offset`. The change
     /// should be immediately visible to all `MemView` associated to this linear space.
     fn write(&self, offset: u64, change: &[u8]);
@@ -117,9 +118,10 @@ impl<T: ?Sized> ObjPtr<T> {
     }
 }
 
-/// A typed, readable handle for the stored item in [ShaleStore]. The object does not contain any
-/// addressing information (and is thus read-only) and just represents the decoded/mapped data.
-/// This should be implemented by [Obj::from_typed_view] or see [MummyObj::ptr_to_obj].
+/// A typed, read-writable handle for the stored item in [ShaleStore]. The object does not contain
+/// any addressing information (and is thus read-only) and just represents the decoded/mapped data.
+/// The implementor of [ShaleStore] could use [Obj] and [ObjCache] to turn a `TypedView` into an
+/// [ObjRef].
 pub trait TypedView<T: ?Sized>: Deref<Target = T> {
     /// Access it as a [MemView] object.
     fn as_mem_view(&self) -> &dyn MemView;
@@ -132,6 +134,11 @@ pub trait TypedView<T: ?Sized>: Deref<Target = T> {
     fn is_mem_mapped(&self) -> bool;
 }
 
+/// An addressed, typed, and read-writable handle for the stored item in [ShaleStore]. The direct
+/// construction (by [Obj::from_typed_view] or [MummyObj::ptr_to_obj]) could be useful for some
+/// unsafe access to a low-level item (e.g. headers/metadata at bootstrap or part of [ShaleStore]
+/// implementation) stored at a given [ObjPtr]. Users of [ShaleStore] implementation, however, will
+/// only use [ObjRef] for safeguarded access.
 pub struct Obj<T: ?Sized> {
     addr_: u64,
     space_id: SpaceID,
@@ -147,6 +154,7 @@ impl<T: ?Sized> Obj<T> {
 
 impl<T: ?Sized> Obj<T> {
     /// Write to the underlying object. Returns `Some(())` on success.
+    #[inline]
     pub fn write(&mut self, modify: impl FnOnce(&mut T) -> ()) -> Option<()> {
         modify(self.inner.write());
         let lspace = self.inner.as_mem_view().mem_image();
@@ -154,16 +162,15 @@ impl<T: ?Sized> Obj<T> {
         if !self.inner.is_mem_mapped() {
             lspace.write(self.addr_, &new_value);
         }
-        if new_value.len() == 0 {
-            return Some(())
-        }
         Some(())
     }
 
+    #[inline(always)]
     pub fn get_space_id(&self) -> SpaceID {
         self.space_id
     }
 
+    #[inline(always)]
     pub unsafe fn from_typed_view(
         addr_: u64, space_id: SpaceID, r: Box<dyn TypedView<T>>,
     ) -> Self {
@@ -182,10 +189,10 @@ impl<T> Deref for Obj<T> {
     }
 }
 
-/// Handle offers read & write access to the stored [ShaleStore] item.
+/// User handle that offers read & write access to the stored [ShaleStore] item.
 pub struct ObjRef<'a, T> {
     inner: Option<Obj<T>>,
-    cache: Rc<ObjCacheInner<T>>,
+    cache: ObjCache<T>,
     _life: PhantomData<&'a mut ()>,
 }
 
@@ -193,7 +200,7 @@ impl<'a, T> ObjRef<'a, T> {
     pub unsafe fn to_longlive(mut self) -> ObjRef<'static, T> {
         ObjRef {
             inner: self.inner.take(),
-            cache: self.cache.clone(),
+            cache: ObjCache(self.cache.0.clone()),
             _life: PhantomData,
         }
     }
@@ -216,14 +223,14 @@ impl<'a, T> Drop for ObjRef<'a, T> {
     fn drop(&mut self) {
         let inner = self.inner.take().unwrap();
         let ptr = inner.as_ptr();
-        self.cache.0.borrow_mut().put(ptr, Some(inner));
+        self.cache.get_inner_mut().put(ptr, Some(inner));
     }
 }
 
 /// A persistent item storage backed by linear logical space. New items can be created and old
-/// items could be dropped or retrieved.
+/// items could be retrieved or dropped.
 pub trait ShaleStore<T> {
-    /// Derference the [ObjPtr] to a handle that gives direct access to the item in memory.
+    /// Dereference [ObjPtr] to a unique handle that allows direct access to the item in memory.
     fn get_item<'a>(
         &'a self, ptr: ObjPtr<T>,
     ) -> Result<ObjRef<'a, T>, ShaleError>;
@@ -231,11 +238,11 @@ pub trait ShaleStore<T> {
     fn put_item<'a>(
         &'a self, item: T, extra: u64,
     ) -> Result<ObjRef<'a, T>, ShaleError>;
-    /// Free a item and recycle its space when applicable.
+    /// Free an item and recycle its space when applicable.
     fn free_item(&mut self, item: ObjPtr<T>) -> Result<(), ShaleError>;
 }
 
-/// A stored item type that could be decoded from or encoded to on-disk raw bytes. An efficient
+/// A stored item type that can be decoded from or encoded to on-disk raw bytes. An efficient
 /// implementation could be directly transmuting to/from a POD struct. But sometimes necessary
 /// compression/decompression is needed to reduce disk I/O and facilitate faster in-memory access.
 pub trait MummyItem {
@@ -250,8 +257,8 @@ pub trait MummyItem {
     }
 }
 
-/// Reference implementation of [TypedView]. It takes any type that implements [MummyItem] and should
-/// be used in most of the circumstances.
+/// Reference implementation of [TypedView]. It takes any type that implements [MummyItem] and
+/// should be useful for most applications.
 pub struct MummyObj<T> {
     decoded: T,
     raw: Box<dyn MemView>,
@@ -286,6 +293,7 @@ impl<T: MummyItem> TypedView<T> for MummyObj<T> {
 }
 
 impl<T: MummyItem + 'static> MummyObj<T> {
+    #[inline(always)]
     fn new(
         addr: u64, len_limit: u64, space: &dyn MemStore,
     ) -> Result<Self, ShaleError> {
@@ -293,11 +301,13 @@ impl<T: MummyItem + 'static> MummyObj<T> {
         Ok(Self {
             decoded,
             raw: space
-                .get_ref(addr, length)
+                .get_view(addr, length)
                 .ok_or(ShaleError::LinearMemStoreError)?,
             len_limit,
         })
     }
+
+    #[inline(always)]
     fn from_hydrated(
         addr: u64, length: u64, len_limit: u64, decoded: T,
         space: &dyn MemStore,
@@ -305,12 +315,13 @@ impl<T: MummyItem + 'static> MummyObj<T> {
         Ok(Self {
             decoded,
             raw: space
-                .get_ref(addr, length)
+                .get_view(addr, length)
                 .ok_or(ShaleError::LinearMemStoreError)?,
             len_limit,
         })
     }
 
+    #[inline(always)]
     pub unsafe fn ptr_to_obj(
         store: &dyn MemStore, ptr: ObjPtr<T>, len_limit: u64,
     ) -> Result<Obj<T>, ShaleError> {
@@ -318,10 +329,11 @@ impl<T: MummyItem + 'static> MummyObj<T> {
         Ok(Obj::from_typed_view(
             addr,
             store.id(),
-            Box::new(MummyObj::new(addr, len_limit, store)?),
+            Box::new(Self::new(addr, len_limit, store)?),
         ))
     }
 
+    #[inline(always)]
     pub unsafe fn item_to_obj(
         store: &dyn MemStore, addr: u64, length: u64, len_limit: u64,
         decoded: T,
@@ -329,7 +341,7 @@ impl<T: MummyItem + 'static> MummyObj<T> {
         Ok(Obj::from_typed_view(
             addr,
             store.id(),
-            Box::new(MummyObj::from_hydrated(
+            Box::new(Self::from_hydrated(
                 addr, length, len_limit, decoded, store,
             )?),
         ))
@@ -344,7 +356,7 @@ impl<T> MummyObj<T> {
         Ok(Self {
             decoded,
             raw: space
-                .get_ref(addr, length)
+                .get_view(addr, length)
                 .ok_or(ShaleError::LinearMemStoreError)?,
             len_limit,
         })
@@ -377,13 +389,13 @@ impl<T> MummyItem for ObjPtr<T> {
     fn hydrate(
         addr: u64, mem: &dyn MemStore,
     ) -> Result<(u64, Self), ShaleError> {
-        const SIZE: u64 = 8;
+        const MSIZE: u64 = 8;
         let raw = mem
-            .get_ref(addr, SIZE)
+            .get_view(addr, MSIZE)
             .ok_or(ShaleError::LinearMemStoreError)?;
         unsafe {
             Ok((
-                SIZE,
+                MSIZE,
                 Self::new_from_addr(u64::from_le_bytes(
                     (**raw).try_into().unwrap(),
                 )),
@@ -392,7 +404,9 @@ impl<T> MummyItem for ObjPtr<T> {
     }
 }
 
-#[derive(Clone)]
+/// Purely volatile, vector-based implementation for [MemStore]. This is good for testing or trying
+/// out stuff (persistent data structures) built on [ShaleStore] in memory, without having to write
+/// your own [MemStore] implementation.
 pub struct PlainMem {
     space: Rc<UnsafeCell<Vec<u8>>>,
     id: SpaceID,
@@ -411,7 +425,7 @@ impl PlainMem {
 }
 
 impl MemStore for PlainMem {
-    fn get_ref(&self, offset: u64, length: u64) -> Option<Box<dyn MemView>> {
+    fn get_view(&self, offset: u64, length: u64) -> Option<Box<dyn MemView>> {
         let offset = offset as usize;
         let length = length as usize;
         if offset + length > self.get_space_mut().len() {
@@ -420,7 +434,10 @@ impl MemStore for PlainMem {
             Some(Box::new(PlainMemRef {
                 offset,
                 length,
-                mem: self.clone(),
+                mem: Self {
+                    space: self.space.clone(),
+                    id: self.id,
+                },
             }))
         }
     }
@@ -455,31 +472,33 @@ impl MemView for PlainMemRef {
     }
 }
 
-use std::cell::RefCell;
-use std::num::NonZeroUsize;
-
-struct ObjCacheInner<T: ?Sized>(
-    RefCell<lru::LruCache<ObjPtr<T>, Option<Obj<T>>>>,
+/// [ObjRef] pool that is used by [ShaleStore] implementation to construct [ObjRef]s.
+pub struct ObjCache<T: ?Sized>(
+    Rc<UnsafeCell<lru::LruCache<ObjPtr<T>, Option<Obj<T>>>>>,
 );
-
-pub struct ObjCache<T: ?Sized>(Rc<ObjCacheInner<T>>);
 
 impl<T> ObjCache<T> {
     pub fn new(capacity: usize) -> Self {
-        Self(Rc::new(ObjCacheInner(RefCell::new(lru::LruCache::new(
+        Self(Rc::new(UnsafeCell::new(lru::LruCache::new(
             NonZeroUsize::new(capacity).expect("non-zero cache size"),
-        )))))
+        ))))
     }
 
+    #[inline(always)]
+    fn get_inner_mut(&self) -> &mut lru::LruCache<ObjPtr<T>, Option<Obj<T>>> {
+        unsafe { &mut *self.0.get() }
+    }
+
+    #[inline(always)]
     pub fn get<'a>(
         &'a self, ptr: ObjPtr<T>,
     ) -> Result<Option<ObjRef<'a, T>>, ShaleError> {
-        let mut pinned = self.0 .0.borrow_mut();
+        let pinned = self.get_inner_mut();
         if let Some(r) = pinned.get_mut(&ptr) {
             return match r.take() {
                 Some(r) => Ok(Some(ObjRef {
                     inner: Some(r),
-                    cache: self.0.clone(),
+                    cache: Self(self.0.clone()),
                     _life: PhantomData,
                 })),
                 None => Err(ShaleError::ObjRefError),
@@ -488,17 +507,19 @@ impl<T> ObjCache<T> {
         Ok(None)
     }
 
+    #[inline(always)]
     pub fn put<'a>(&'a self, inner: Obj<T>) -> ObjRef<'a, T> {
         let ptr = inner.as_ptr();
-        self.0 .0.borrow_mut().put(ptr, None);
+        self.get_inner_mut().put(ptr, None);
         ObjRef {
             inner: Some(inner),
-            cache: self.0.clone(),
+            cache: Self(self.0.clone()),
             _life: PhantomData,
         }
     }
 
+    #[inline(always)]
     pub fn pop(&self, ptr: ObjPtr<T>) {
-        self.0 .0.borrow_mut().pop(&ptr);
+        self.get_inner_mut().pop(&ptr);
     }
 }

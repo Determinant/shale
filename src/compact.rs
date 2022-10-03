@@ -28,7 +28,7 @@ impl MummyItem for CompactHeader {
         addr: u64, mem: &dyn MemStore,
     ) -> Result<(u64, Self), ShaleError> {
         let raw = mem
-            .get_ref(addr, Self::MSIZE)
+            .get_view(addr, Self::MSIZE)
             .ok_or(ShaleError::LinearMemStoreError)?;
         let payload_size = u64::from_le_bytes(raw[..8].try_into().unwrap());
         let is_freed = if raw[8] == 0 { false } else { true };
@@ -66,7 +66,7 @@ impl MummyItem for CompactFooter {
         addr: u64, mem: &dyn MemStore,
     ) -> Result<(u64, Self), ShaleError> {
         let raw = mem
-            .get_ref(addr, Self::MSIZE)
+            .get_view(addr, Self::MSIZE)
             .ok_or(ShaleError::LinearMemStoreError)?;
         let payload_size = u64::from_le_bytes(raw.deref().try_into().unwrap());
         Ok((Self::MSIZE, Self { payload_size }))
@@ -95,7 +95,7 @@ impl MummyItem for CompactDescriptor {
         addr: u64, mem: &dyn MemStore,
     ) -> Result<(u64, Self), ShaleError> {
         let raw = mem
-            .get_ref(addr, Self::MSIZE)
+            .get_view(addr, Self::MSIZE)
             .ok_or(ShaleError::LinearMemStoreError)?;
         let payload_size = u64::from_le_bytes(raw[..8].try_into().unwrap());
         let haddr = u64::from_le_bytes(raw[8..].try_into().unwrap());
@@ -174,7 +174,7 @@ impl MummyItem for CompactSpaceHeader {
         addr: u64, mem: &dyn MemStore,
     ) -> Result<(u64, Self), ShaleError> {
         let raw = mem
-            .get_ref(addr, Self::MSIZE)
+            .get_view(addr, Self::MSIZE)
             .ok_or(ShaleError::LinearMemStoreError)?;
         let meta_space_tail = u64::from_le_bytes(raw[..8].try_into().unwrap());
         let compact_space_tail =
@@ -213,7 +213,7 @@ impl<T> MummyItem for ObjPtrField<T> {
     ) -> Result<(u64, Self), ShaleError> {
         const SIZE: u64 = 8;
         let raw = mem
-            .get_ref(addr, SIZE)
+            .get_view(addr, SIZE)
             .ok_or(ShaleError::LinearMemStoreError)?;
         unsafe {
             Ok((
@@ -250,7 +250,7 @@ impl MummyItem for U64Field {
     ) -> Result<(u64, Self), ShaleError> {
         const SIZE: u64 = 8;
         let raw = mem
-            .get_ref(addr, SIZE)
+            .get_view(addr, SIZE)
             .ok_or(ShaleError::LinearMemStoreError)?;
         Ok((
             SIZE,
