@@ -12,6 +12,7 @@ use std::rc::Rc;
 pub enum ShaleError {
     LinearMemStoreError,
     DecodeError,
+    ObjRefError,
 }
 
 pub type SpaceID = u8;
@@ -37,21 +38,6 @@ impl std::fmt::Debug for DiskWrite {
     }
 }
 
-/// A typed, readable handle for the stored item in [ShaleStore]. The object does not contain any
-/// addressing information (and is thus read-only) and just represents the decoded/mapped data.
-/// This should be implemented as part of [ShaleRefConverter::into_shale_ref].
-pub trait ShaleRef<T: ?Sized>: Deref<Target = T> {
-    /// Access it as a [MemView] object.
-    fn as_linear_ref(&self) -> &dyn MemView;
-    /// Defines how the current in-memory object of `T` should be represented in the linear storage space.
-    fn to_mem_image(&self) -> Option<Box<[u8]>>;
-    /// Write to the typed content.
-    fn write(&mut self) -> &mut T;
-    /// Returns if the typed content is memory-mapped (i.e., all changes through `write` are auto
-    /// reflected in the underlying [MemStore]).
-    fn is_mem_mapped(&self) -> bool;
-}
-
 /// A handle that pins a portion of the linear memory image.
 pub trait MemView: Deref<Target = [u8]> {
     /// Returns the underlying linear in-memory store.
@@ -71,9 +57,6 @@ pub trait MemStore {
     fn write(&self, offset: u64, change: &[u8]);
     /// Returns the identifier of this storage space.
     fn id(&self) -> SpaceID;
-    ///// Grows the space by a specified number of bytes and returns the original size. Use 0 to get
-    ///// the current size.
-    //fn grow(&self, extra: u64) -> u64;
 }
 
 /// Opaque typed pointer in the 64-bit virtual addressable space.
@@ -94,6 +77,12 @@ impl<T> Copy for ObjPtr<T> {}
 impl<T> Clone for ObjPtr<T> {
     fn clone(&self) -> Self {
         *self
+    }
+}
+
+impl<T> std::hash::Hash for ObjPtr<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.addr.hash(state)
     }
 }
 
@@ -128,43 +117,39 @@ impl<T: ?Sized> ObjPtr<T> {
     }
 }
 
-impl<T> std::hash::Hash for ObjPtr<T> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.addr.hash(state)
-    }
+/// A typed, readable handle for the stored item in [ShaleStore]. The object does not contain any
+/// addressing information (and is thus read-only) and just represents the decoded/mapped data.
+/// This should be implemented by [Obj::from_typed_view] or see [MummyObj::ptr_to_obj].
+pub trait TypedView<T: ?Sized>: Deref<Target = T> {
+    /// Access it as a [MemView] object.
+    fn as_mem_view(&self) -> &dyn MemView;
+    /// Defines how the current in-memory object of `T` should be represented in the linear storage space.
+    fn to_mem_image(&self) -> Option<Box<[u8]>>;
+    /// Write to the typed content.
+    fn write(&mut self) -> &mut T;
+    /// Returns if the typed content is memory-mapped (i.e., all changes through `write` are auto
+    /// reflected in the underlying [MemStore]).
+    fn is_mem_mapped(&self) -> bool;
 }
 
-/// Handle offers read & write access to the stored [ShaleStore] item.
-pub struct ObjRef<'a, T: ?Sized> {
+pub struct Obj<T: ?Sized> {
     addr_: u64,
     space_id: SpaceID,
-    inner: Box<dyn ShaleRef<T> + 'a>,
+    inner: Box<dyn TypedView<T>>,
 }
 
-impl<'a, T: ?Sized> ObjRef<'a, T> {
+impl<T: ?Sized> Obj<T> {
     #[inline(always)]
     pub fn as_ptr(&self) -> ObjPtr<T> {
         ObjPtr::<T>::new(self.addr_)
     }
-
-    pub unsafe fn to_longlive(self) -> ObjRef<'static, T> {
-        let inner = Box::into_raw(self.inner);
-        ObjRef {
-            addr_: self.addr_,
-            space_id: self.space_id,
-            inner: Box::from_raw(std::mem::transmute::<
-                *mut (dyn ShaleRef<T> + 'a),
-                *mut (dyn ShaleRef<T> + 'static),
-            >(inner)),
-        }
-    }
 }
 
-impl<'a, T: ?Sized> ObjRef<'a, T> {
+impl<T: ?Sized> Obj<T> {
     /// Write to the underlying object. Returns `Some(())` on success.
     pub fn write(&mut self, modify: impl FnOnce(&mut T) -> ()) -> Option<()> {
         modify(self.inner.write());
-        let lspace = self.inner.as_linear_ref().mem_image();
+        let lspace = self.inner.as_mem_view().mem_image();
         let new_value = self.inner.to_mem_image()?;
         if !self.inner.is_mem_mapped() {
             lspace.write(self.addr_, &new_value);
@@ -179,10 +164,10 @@ impl<'a, T: ?Sized> ObjRef<'a, T> {
         self.space_id
     }
 
-    pub unsafe fn from_shale(
-        addr_: u64, space_id: SpaceID, r: Box<dyn ShaleRef<T> + 'a>,
+    pub unsafe fn from_typed_view(
+        addr_: u64, space_id: SpaceID, r: Box<dyn TypedView<T>>,
     ) -> Self {
-        ObjRef {
+        Obj {
             addr_,
             space_id,
             inner: r,
@@ -190,28 +175,64 @@ impl<'a, T: ?Sized> ObjRef<'a, T> {
     }
 }
 
-impl<'a, T> Deref for ObjRef<'a, T> {
+impl<T> Deref for Obj<T> {
     type Target = T;
     fn deref(&self) -> &T {
         &*self.inner
     }
 }
 
+/// Handle offers read & write access to the stored [ShaleStore] item.
+pub struct ObjRef<'a, T> {
+    inner: Option<Obj<T>>,
+    cache: Rc<ObjCacheInner<T>>,
+    _life: PhantomData<&'a mut ()>,
+}
+
+impl<'a, T> ObjRef<'a, T> {
+    pub unsafe fn to_longlive(mut self) -> ObjRef<'static, T> {
+        ObjRef {
+            inner: self.inner.take(),
+            cache: self.cache.clone(),
+            _life: PhantomData,
+        }
+    }
+}
+
+impl<'a, T> Deref for ObjRef<'a, T> {
+    type Target = Obj<T>;
+    fn deref(&self) -> &Obj<T> {
+        self.inner.as_ref().unwrap()
+    }
+}
+
+impl<'a, T> std::ops::DerefMut for ObjRef<'a, T> {
+    fn deref_mut(&mut self) -> &mut Obj<T> {
+        self.inner.as_mut().unwrap()
+    }
+}
+
+impl<'a, T> Drop for ObjRef<'a, T> {
+    fn drop(&mut self) {
+        let inner = self.inner.take().unwrap();
+        let ptr = inner.as_ptr();
+        self.cache.0.borrow_mut().put(ptr, Some(inner));
+    }
+}
+
 /// A persistent item storage backed by linear logical space. New items can be created and old
 /// items could be dropped or retrieved.
-pub trait ShaleStore {
+pub trait ShaleStore<T> {
     /// Derference the [ObjPtr] to a handle that gives direct access to the item in memory.
-    fn get_item<'a, T: MummyItem + 'a>(
+    fn get_item<'a>(
         &'a self, ptr: ObjPtr<T>,
     ) -> Result<ObjRef<'a, T>, ShaleError>;
     /// Allocate a new item.
-    fn put_item<'a, T: MummyItem + 'a>(
+    fn put_item<'a>(
         &'a self, item: T, extra: u64,
     ) -> Result<ObjRef<'a, T>, ShaleError>;
     /// Free a item and recycle its space when applicable.
-    fn free_item<T: MummyItem>(
-        &mut self, item: ObjPtr<T>,
-    ) -> Result<(), ShaleError>;
+    fn free_item(&mut self, item: ObjPtr<T>) -> Result<(), ShaleError>;
 }
 
 /// A stored item type that could be decoded from or encoded to on-disk raw bytes. An efficient
@@ -229,23 +250,23 @@ pub trait MummyItem {
     }
 }
 
-/// Helper implementation of [ShaleRef]. It takes any type that implements [MummyItem] and should
+/// Reference implementation of [TypedView]. It takes any type that implements [MummyItem] and should
 /// be used in most of the circumstances.
-pub struct MummyRef<T> {
+pub struct MummyObj<T> {
     decoded: T,
     raw: Box<dyn MemView>,
     len_limit: u64,
 }
 
-impl<T> Deref for MummyRef<T> {
+impl<T> Deref for MummyObj<T> {
     type Target = T;
     fn deref(&self) -> &T {
         &self.decoded
     }
 }
 
-impl<T: MummyItem> ShaleRef<T> for MummyRef<T> {
-    fn as_linear_ref(&self) -> &dyn MemView {
+impl<T: MummyItem> TypedView<T> for MummyObj<T> {
+    fn as_mem_view(&self) -> &dyn MemView {
         &*self.raw
     }
     fn to_mem_image(&self) -> Option<Box<[u8]>> {
@@ -264,7 +285,7 @@ impl<T: MummyItem> ShaleRef<T> for MummyRef<T> {
     }
 }
 
-impl<T: MummyItem> MummyRef<T> {
+impl<T: MummyItem + 'static> MummyObj<T> {
     fn new(
         addr: u64, len_limit: u64, space: &dyn MemStore,
     ) -> Result<Self, ShaleError> {
@@ -289,9 +310,33 @@ impl<T: MummyItem> MummyRef<T> {
             len_limit,
         })
     }
+
+    pub unsafe fn ptr_to_obj(
+        store: &dyn MemStore, ptr: ObjPtr<T>, len_limit: u64,
+    ) -> Result<Obj<T>, ShaleError> {
+        let addr = ptr.addr();
+        Ok(Obj::from_typed_view(
+            addr,
+            store.id(),
+            Box::new(MummyObj::new(addr, len_limit, store)?),
+        ))
+    }
+
+    pub unsafe fn item_to_obj(
+        store: &dyn MemStore, addr: u64, length: u64, len_limit: u64,
+        decoded: T,
+    ) -> Result<Obj<T>, ShaleError> {
+        Ok(Obj::from_typed_view(
+            addr,
+            store.id(),
+            Box::new(MummyObj::from_hydrated(
+                addr, length, len_limit, decoded, store,
+            )?),
+        ))
+    }
 }
 
-impl<T> MummyRef<T> {
+impl<T> MummyObj<T> {
     unsafe fn new_from_slice(
         addr: u64, length: u64, len_limit: u64, decoded: T,
         space: &dyn MemStore,
@@ -305,18 +350,18 @@ impl<T> MummyRef<T> {
         })
     }
 
-    pub unsafe fn slice<'b, U: MummyItem + 'b>(
-        s: &ObjRef<'b, T>, offset: u64, length: u64, decoded: U,
-    ) -> Result<ObjRef<'b, U>, ShaleError> {
+    pub unsafe fn slice<U: MummyItem + 'static>(
+        s: &Obj<T>, offset: u64, length: u64, decoded: U,
+    ) -> Result<Obj<U>, ShaleError> {
         let addr_ = s.addr_ + offset;
-        let r = Box::new(MummyRef::new_from_slice(
+        let r = Box::new(MummyObj::new_from_slice(
             addr_,
             length,
             length,
             decoded,
-            s.inner.as_linear_ref().mem_image(),
+            s.inner.as_mem_view().mem_image(),
         )?);
-        Ok(ObjRef {
+        Ok(Obj {
             addr_,
             space_id: s.space_id,
             inner: r,
@@ -410,25 +455,50 @@ impl MemView for PlainMemRef {
     }
 }
 
-pub unsafe fn get_obj_ref<'a, T: 'a + MummyItem>(
-    store: &'a dyn MemStore, ptr: ObjPtr<T>, len_limit: u64,
-) -> Result<ObjRef<'a, T>, ShaleError> {
-    let addr = ptr.addr();
-    Ok(ObjRef::from_shale(
-        addr,
-        store.id(),
-        Box::new(MummyRef::new(addr, len_limit, store)?),
-    ))
-}
+use std::cell::RefCell;
+use std::num::NonZeroUsize;
 
-pub unsafe fn obj_ref_from_item<'a, T: 'a + MummyItem>(
-    store: &'a dyn MemStore, addr: u64, length: u64, len_limit: u64, decoded: T,
-) -> Result<ObjRef<'a, T>, ShaleError> {
-    Ok(ObjRef::from_shale(
-        addr,
-        store.id(),
-        Box::new(MummyRef::from_hydrated(
-            addr, length, len_limit, decoded, store,
-        )?),
-    ))
+struct ObjCacheInner<T: ?Sized>(
+    RefCell<lru::LruCache<ObjPtr<T>, Option<Obj<T>>>>,
+);
+
+pub struct ObjCache<T: ?Sized>(Rc<ObjCacheInner<T>>);
+
+impl<T> ObjCache<T> {
+    pub fn new(capacity: usize) -> Self {
+        Self(Rc::new(ObjCacheInner(RefCell::new(lru::LruCache::new(
+            NonZeroUsize::new(capacity).expect("non-zero cache size"),
+        )))))
+    }
+
+    pub fn get<'a>(
+        &'a self, ptr: ObjPtr<T>,
+    ) -> Result<Option<ObjRef<'a, T>>, ShaleError> {
+        let mut pinned = self.0 .0.borrow_mut();
+        if let Some(r) = pinned.get_mut(&ptr) {
+            return match r.take() {
+                Some(r) => Ok(Some(ObjRef {
+                    inner: Some(r),
+                    cache: self.0.clone(),
+                    _life: PhantomData,
+                })),
+                None => Err(ShaleError::ObjRefError),
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn put<'a>(&'a self, inner: Obj<T>) -> ObjRef<'a, T> {
+        let ptr = inner.as_ptr();
+        self.0 .0.borrow_mut().put(ptr, None);
+        ObjRef {
+            inner: Some(inner),
+            cache: self.0.clone(),
+            _life: PhantomData,
+        }
+    }
+
+    pub fn pop(&self, ptr: ObjPtr<T>) {
+        self.0 .0.borrow_mut().pop(&ptr);
+    }
 }

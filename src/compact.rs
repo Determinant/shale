@@ -1,5 +1,5 @@
 use super::{
-    MemStore, MummyItem, MummyRef, ObjPtr, ObjRef, ShaleError, ShaleStore,
+    MemStore, MummyItem, MummyObj, Obj, ObjPtr, ObjRef, ShaleError, ShaleStore,
 };
 use std::cell::UnsafeCell;
 use std::rc::Rc;
@@ -124,11 +124,11 @@ pub struct CompactSpaceHeader {
     alloc_addr: ObjPtr<CompactDescriptor>,
 }
 
-struct CompactSpaceHeaderSliced<'a> {
-    meta_space_tail: ObjRef<'a, U64Field>,
-    compact_space_tail: ObjRef<'a, U64Field>,
-    base_addr: ObjRef<'a, ObjPtr<CompactDescriptor>>,
-    alloc_addr: ObjRef<'a, ObjPtr<CompactDescriptor>>,
+struct CompactSpaceHeaderSliced {
+    meta_space_tail: Obj<U64Field>,
+    compact_space_tail: Obj<U64Field>,
+    base_addr: Obj<ObjPtr<CompactDescriptor>>,
+    alloc_addr: Obj<ObjPtr<CompactDescriptor>>,
 }
 
 impl CompactSpaceHeader {
@@ -145,25 +145,25 @@ impl CompactSpaceHeader {
         }
     }
 
-    fn into_fields<'a>(
-        r: ObjRef<'a, Self>,
-    ) -> Result<CompactSpaceHeaderSliced<'a>, ShaleError> {
+    fn into_fields(
+        r: Obj<Self>,
+    ) -> Result<CompactSpaceHeaderSliced, ShaleError> {
         unsafe {
             Ok(CompactSpaceHeaderSliced {
-                meta_space_tail: MummyRef::slice(
+                meta_space_tail: MummyObj::slice(
                     &r,
                     0,
                     8,
                     U64Field(r.meta_space_tail),
                 )?,
-                compact_space_tail: MummyRef::slice(
+                compact_space_tail: MummyObj::slice(
                     &r,
                     8,
                     8,
                     U64Field(r.compact_space_tail),
                 )?,
-                base_addr: MummyRef::slice(&r, 16, 8, r.base_addr)?,
-                alloc_addr: MummyRef::slice(&r, 24, 8, r.alloc_addr)?,
+                base_addr: MummyObj::slice(&r, 16, 8, r.base_addr)?,
+                alloc_addr: MummyObj::slice(&r, 24, 8, r.alloc_addr)?,
             })
         }
     }
@@ -275,20 +275,21 @@ impl std::ops::DerefMut for U64Field {
     }
 }
 
-struct CompactSpaceInner {
+struct CompactSpaceInner<T: MummyItem> {
     meta_space: Rc<dyn MemStore>,
     compact_space: Rc<dyn MemStore>,
-    header: CompactSpaceHeaderSliced<'static>,
+    header: CompactSpaceHeaderSliced,
+    obj_cache: super::ObjCache<T>,
     alloc_max_walk: u64,
     regn_nbit: u64,
 }
 
-impl CompactSpaceInner {
-    fn get_descriptor<'a>(
-        &'a self, ptr: ObjPtr<CompactDescriptor>,
-    ) -> Result<ObjRef<'a, CompactDescriptor>, ShaleError> {
+impl<T: MummyItem> CompactSpaceInner<T> {
+    fn get_descriptor(
+        &self, ptr: ObjPtr<CompactDescriptor>,
+    ) -> Result<Obj<CompactDescriptor>, ShaleError> {
         unsafe {
-            super::get_obj_ref(
+            MummyObj::ptr_to_obj(
                 self.meta_space.as_ref(),
                 ptr,
                 CompactDescriptor::MSIZE,
@@ -296,11 +297,11 @@ impl CompactSpaceInner {
         }
     }
 
-    fn get_data_ref<'a, T: MummyItem + 'a>(
-        &'a self, ptr: ObjPtr<T>, len_limit: u64,
-    ) -> Result<ObjRef<'a, T>, ShaleError> {
+    fn get_data_ref<U: MummyItem + 'static>(
+        &self, ptr: ObjPtr<U>, len_limit: u64,
+    ) -> Result<Obj<U>, ShaleError> {
         unsafe {
-            super::get_obj_ref(self.compact_space.as_ref(), ptr, len_limit)
+            MummyObj::ptr_to_obj(self.compact_space.as_ref(), ptr, len_limit)
         }
     }
 
@@ -587,21 +588,22 @@ impl CompactSpaceInner {
     }
 }
 
-pub struct CompactSpace {
-    inner: UnsafeCell<CompactSpaceInner>,
+pub struct CompactSpace<T: MummyItem> {
+    inner: UnsafeCell<CompactSpaceInner<T>>,
 }
 
-impl CompactSpace {
+impl<T: MummyItem> CompactSpace<T> {
     pub fn new(
         meta_space: Rc<dyn MemStore>, compact_space: Rc<dyn MemStore>,
-        header: ObjRef<'static, CompactSpaceHeader>, alloc_max_walk: u64,
-        regn_nbit: u64,
+        header: Obj<CompactSpaceHeader>, obj_cache: super::ObjCache<T>,
+        alloc_max_walk: u64, regn_nbit: u64,
     ) -> Result<Self, ShaleError> {
         let cs = CompactSpace {
             inner: UnsafeCell::new(CompactSpaceInner {
                 meta_space,
                 compact_space,
                 header: CompactSpaceHeader::into_fields(header)?,
+                obj_cache,
                 alloc_max_walk,
                 regn_nbit,
             }),
@@ -610,8 +612,8 @@ impl CompactSpace {
     }
 }
 
-impl ShaleStore for CompactSpace {
-    fn put_item<'a, T: MummyItem + 'a>(
+impl<T: MummyItem + 'static> ShaleStore<T> for CompactSpace<T> {
+    fn put_item<'a>(
         &'a self, item: T, extra: u64,
     ) -> Result<ObjRef<'a, T>, ShaleError> {
         let bytes = item.dehydrate();
@@ -626,8 +628,8 @@ impl ShaleStore for CompactSpace {
                 },
             )
         };
-        let mut u: ObjRef<T> = unsafe {
-            super::obj_ref_from_item(
+        let mut u: Obj<T> = unsafe {
+            MummyObj::item_to_obj(
                 inner.compact_space.as_ref(),
                 ptr.addr(),
                 size,
@@ -636,23 +638,28 @@ impl ShaleStore for CompactSpace {
             )?
         };
         u.write(|_| {});
-        Ok(u)
+        Ok(inner.obj_cache.put(u))
     }
 
-    fn free_item<T: MummyItem>(
-        &mut self, item: ObjPtr<T>,
-    ) -> Result<(), ShaleError> {
-        self.inner.get_mut().free(item.addr())
+    fn free_item(&mut self, ptr: ObjPtr<T>) -> Result<(), ShaleError> {
+        let inner = self.inner.get_mut();
+        inner.obj_cache.pop(ptr);
+        inner.free(ptr.addr())
     }
 
-    fn get_item<'a, T: MummyItem + 'a>(
+    fn get_item<'a>(
         &'a self, ptr: ObjPtr<T>,
     ) -> Result<ObjRef<'a, T>, ShaleError> {
         let inner = unsafe { &*self.inner.get() };
+        if let Some(r) = inner.obj_cache.get(ptr)? {
+            return Ok(r)
+        }
         let h = inner.get_data_ref::<CompactHeader>(
             ObjPtr::new(ptr.addr() - CompactHeader::MSIZE),
             CompactHeader::MSIZE,
         )?;
-        inner.get_data_ref(ptr, h.payload_size)
+        Ok(inner
+            .obj_cache
+            .put(inner.get_data_ref(ptr, h.payload_size)?))
     }
 }
