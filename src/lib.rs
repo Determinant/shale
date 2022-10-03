@@ -43,6 +43,8 @@ impl std::fmt::Debug for DiskWrite {
 pub trait MemView: Deref<Target = [u8]> {
     /// Returns the underlying linear in-memory store.
     fn mem_image(&self) -> &dyn MemStore;
+    /// Get the interval (offset, length).
+    fn get_interval(&self) -> (u64, u64);
 }
 
 /// In-memory store that offers access to intervals from a linear byte space, which is usually
@@ -118,10 +120,9 @@ impl<T: ?Sized> ObjPtr<T> {
     }
 }
 
-/// A typed, read-writable handle for the stored item in [ShaleStore]. The object does not contain
-/// any addressing information (and is thus read-only) and just represents the decoded/mapped data.
-/// The implementor of [ShaleStore] could use [Obj] and [ObjCache] to turn a `TypedView` into an
-/// [ObjRef].
+/// A addressed, typed, and read-writable handle for the stored item in [ShaleStore]. The object
+/// represents the decoded/mapped data. The implementation of [ShaleStore] could use [ObjCache] to
+/// turn a `TypedView` into an [ObjRef].
 pub trait TypedView<T: ?Sized>: Deref<Target = T> {
     /// Access it as a [MemView] object.
     fn as_mem_view(&self) -> &dyn MemView;
@@ -134,21 +135,16 @@ pub trait TypedView<T: ?Sized>: Deref<Target = T> {
     fn is_mem_mapped(&self) -> bool;
 }
 
-/// An addressed, typed, and read-writable handle for the stored item in [ShaleStore]. The direct
-/// construction (by [Obj::from_typed_view] or [MummyObj::ptr_to_obj]) could be useful for some
-/// unsafe access to a low-level item (e.g. headers/metadata at bootstrap or part of [ShaleStore]
-/// implementation) stored at a given [ObjPtr]. Users of [ShaleStore] implementation, however, will
-/// only use [ObjRef] for safeguarded access.
-pub struct Obj<T: ?Sized> {
-    addr_: u64,
-    space_id: SpaceID,
-    inner: Box<dyn TypedView<T>>,
-}
+/// A wrapper of `TypedView` to enable writes. The direct construction (by [Obj::from_typed_view]
+/// or [MummyObj::ptr_to_obj]) could be useful for some unsafe access to a low-level item (e.g.
+/// headers/metadata at bootstrap or part of [ShaleStore] implementation) stored at a given [ObjPtr]
+/// . Users of [ShaleStore] implementation, however, will only use [ObjRef] for safeguarded access.
+pub struct Obj<T: ?Sized>(Box<dyn TypedView<T>>);
 
 impl<T: ?Sized> Obj<T> {
     #[inline(always)]
     pub fn as_ptr(&self) -> ObjPtr<T> {
-        ObjPtr::<T>::new(self.addr_)
+        ObjPtr::<T>::new(self.0.as_mem_view().get_interval().0)
     }
 }
 
@@ -156,36 +152,30 @@ impl<T: ?Sized> Obj<T> {
     /// Write to the underlying object. Returns `Some(())` on success.
     #[inline]
     pub fn write(&mut self, modify: impl FnOnce(&mut T) -> ()) -> Option<()> {
-        modify(self.inner.write());
-        let lspace = self.inner.as_mem_view().mem_image();
-        let new_value = self.inner.to_mem_image()?;
-        if !self.inner.is_mem_mapped() {
-            lspace.write(self.addr_, &new_value);
+        modify(self.0.write());
+        let lspace = self.0.as_mem_view().mem_image();
+        let new_value = self.0.to_mem_image()?;
+        if !self.0.is_mem_mapped() {
+            lspace.write(self.0.as_mem_view().get_interval().0, &new_value);
         }
         Some(())
     }
 
     #[inline(always)]
     pub fn get_space_id(&self) -> SpaceID {
-        self.space_id
+        self.0.as_mem_view().mem_image().id()
     }
 
     #[inline(always)]
-    pub unsafe fn from_typed_view(
-        addr_: u64, space_id: SpaceID, r: Box<dyn TypedView<T>>,
-    ) -> Self {
-        Obj {
-            addr_,
-            space_id,
-            inner: r,
-        }
+    pub fn from_typed_view(v: Box<dyn TypedView<T>>) -> Self {
+        Obj(v)
     }
 }
 
 impl<T> Deref for Obj<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        &*self.inner
+        &*self.0
     }
 }
 
@@ -326,11 +316,9 @@ impl<T: MummyItem + 'static> MummyObj<T> {
         store: &dyn MemStore, ptr: ObjPtr<T>, len_limit: u64,
     ) -> Result<Obj<T>, ShaleError> {
         let addr = ptr.addr();
-        Ok(Obj::from_typed_view(
-            addr,
-            store.id(),
-            Box::new(Self::new(addr, len_limit, store)?),
-        ))
+        Ok(Obj::from_typed_view(Box::new(Self::new(
+            addr, len_limit, store,
+        )?)))
     }
 
     #[inline(always)]
@@ -338,13 +326,9 @@ impl<T: MummyItem + 'static> MummyObj<T> {
         store: &dyn MemStore, addr: u64, length: u64, len_limit: u64,
         decoded: T,
     ) -> Result<Obj<T>, ShaleError> {
-        Ok(Obj::from_typed_view(
-            addr,
-            store.id(),
-            Box::new(Self::from_hydrated(
-                addr, length, len_limit, decoded, store,
-            )?),
-        ))
+        Ok(Obj::from_typed_view(Box::new(Self::from_hydrated(
+            addr, length, len_limit, decoded, store,
+        )?)))
     }
 }
 
@@ -365,19 +349,15 @@ impl<T> MummyObj<T> {
     pub unsafe fn slice<U: MummyItem + 'static>(
         s: &Obj<T>, offset: u64, length: u64, decoded: U,
     ) -> Result<Obj<U>, ShaleError> {
-        let addr_ = s.addr_ + offset;
+        let addr_ = s.0.as_mem_view().get_interval().0 + offset;
         let r = Box::new(MummyObj::new_from_slice(
             addr_,
             length,
             length,
             decoded,
-            s.inner.as_mem_view().mem_image(),
+            s.0.as_mem_view().mem_image(),
         )?);
-        Ok(Obj {
-            addr_,
-            space_id: s.space_id,
-            inner: r,
-        })
+        Ok(Obj(r))
     }
 }
 
@@ -469,6 +449,9 @@ impl Deref for PlainMemRef {
 impl MemView for PlainMemRef {
     fn mem_image(&self) -> &dyn MemStore {
         &self.mem
+    }
+    fn get_interval(&self) -> (u64, u64) {
+        (self.offset as u64, self.length as u64)
     }
 }
 
