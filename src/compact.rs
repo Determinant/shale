@@ -344,25 +344,21 @@ impl<T: MummyItem> CompactSpaceInner<T> {
         let regn_size = 1 << self.regn_nbit;
 
         let mut offset = addr - hsize;
-        let header_payload_size;
-        {
+        let header_payload_size = {
             let header = self.get_data_ref::<CompactHeader>(
                 ObjPtr::new(offset),
                 CompactHeader::MSIZE,
             )?;
-            header_payload_size = header.payload_size;
             assert!(!header.is_freed);
-        }
+            header.payload_size
+        };
         let mut h = offset;
         let mut payload_size = header_payload_size;
 
         if offset & (regn_size - 1) > 0 {
             // merge with lower data segment
             offset -= fsize;
-            let pheader_is_freed;
-            let pheader_payload_size;
-            let pheader_desc_addr;
-            {
+            let (pheader_is_freed, pheader_payload_size, pheader_desc_addr) = {
                 let pfooter = self.get_data_ref::<CompactFooter>(
                     ObjPtr::new(offset),
                     CompactFooter::MSIZE,
@@ -372,10 +368,8 @@ impl<T: MummyItem> CompactSpaceInner<T> {
                     ObjPtr::new(offset),
                     CompactHeader::MSIZE,
                 )?;
-                pheader_is_freed = pheader.is_freed;
-                pheader_payload_size = pheader.payload_size;
-                pheader_desc_addr = pheader.desc_addr;
-            }
+                (pheader.is_freed, pheader.payload_size, pheader.desc_addr)
+            };
             if pheader_is_freed {
                 h = offset;
                 payload_size += hsize + fsize + pheader_payload_size;
@@ -391,18 +385,13 @@ impl<T: MummyItem> CompactSpaceInner<T> {
         {
             // merge with higher data segment
             offset += fsize;
-            let nheader_is_freed;
-            let nheader_payload_size;
-            let nheader_desc_addr;
-            {
+            let (nheader_is_freed, nheader_payload_size, nheader_desc_addr) = {
                 let nheader = self.get_data_ref::<CompactHeader>(
                     ObjPtr::new(offset),
                     CompactHeader::MSIZE,
                 )?;
-                nheader_is_freed = nheader.is_freed;
-                nheader_payload_size = nheader.payload_size;
-                nheader_desc_addr = nheader.desc_addr;
-            }
+                (nheader.is_freed, nheader.payload_size, nheader.desc_addr)
+            };
             if nheader_is_freed {
                 offset += hsize + nheader_payload_size;
                 f = offset;
@@ -465,13 +454,10 @@ impl<T: MummyItem> CompactSpaceInner<T> {
         let mut res: Option<u64> = None;
         for _ in 0..self.alloc_max_walk {
             assert!(ptr.addr < tail);
-            let desc_payload_size;
-            let desc_haddr;
-            {
+            let (desc_payload_size, desc_haddr) = {
                 let desc = self.get_descriptor(ptr)?;
-                desc_payload_size = desc.payload_size;
-                desc_haddr = desc.haddr;
-            }
+                (desc.payload_size, desc.haddr)
+            };
             let exit = if desc_payload_size == length {
                 // perfect match
                 {
@@ -558,15 +544,15 @@ impl<T: MummyItem> CompactSpaceInner<T> {
     }
 
     fn alloc_new(&mut self, length: u64) -> Result<u64, ShaleError> {
-        let offset = **self.header.compact_space_tail;
         let regn_size = 1 << self.regn_nbit;
-        let mut total_length =
-            CompactHeader::MSIZE + length + CompactFooter::MSIZE;
+        let total_length = CompactHeader::MSIZE + length + CompactFooter::MSIZE;
+        let mut offset = **self.header.compact_space_tail;
         self.header.compact_space_tail.write(|r| {
             // an item is always fully in one region
             let rem = regn_size - (offset & (regn_size - 1));
             if rem < total_length {
-                total_length += rem
+                offset += rem;
+                **r += rem;
             }
             **r += total_length
         });
