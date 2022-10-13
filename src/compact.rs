@@ -628,7 +628,6 @@ impl<T: MummyItem + 'static> ShaleStore<T> for CompactSpace<T> {
         if let Some(r) = inner.obj_cache.get(ptr)? {
             return Ok(r)
         }
-        println!("get_item {:x}", ptr.addr());
         let h =
             inner.get_header(ObjPtr::new(ptr.addr() - CompactHeader::MSIZE))?;
         Ok(inner
