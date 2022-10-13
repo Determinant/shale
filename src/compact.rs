@@ -1,5 +1,6 @@
 use super::{
-    MemStore, MummyItem, MummyObj, Obj, ObjPtr, ObjRef, ShaleError, ShaleStore,
+    MemStore, MummyItem, MummyObj, Obj, ObjCache, ObjPtr, ObjRef, ShaleError,
+    ShaleStore,
 };
 use std::cell::UnsafeCell;
 use std::rc::Rc;
@@ -280,6 +281,8 @@ struct CompactSpaceInner<T: MummyItem> {
     compact_space: Rc<dyn MemStore>,
     header: CompactSpaceHeaderSliced,
     obj_cache: super::ObjCache<T>,
+    header_cache: ObjCache<CompactHeader>,
+    footer_cache: ObjCache<CompactFooter>,
     alloc_max_walk: u64,
     regn_nbit: u64,
 }
@@ -305,6 +308,28 @@ impl<T: MummyItem> CompactSpaceInner<T> {
         }
     }
 
+    fn get_header(
+        &self, ptr: ObjPtr<CompactHeader>,
+    ) -> Result<ObjRef<CompactHeader>, ShaleError> {
+        if let Some(r) = self.header_cache.get(ptr)? {
+            return Ok(r)
+        }
+        Ok(self.header_cache.put(
+            self.get_data_ref::<CompactHeader>(ptr, CompactHeader::MSIZE)?,
+        ))
+    }
+
+    fn get_footer(
+        &self, ptr: ObjPtr<CompactFooter>,
+    ) -> Result<ObjRef<CompactFooter>, ShaleError> {
+        if let Some(r) = self.footer_cache.get(ptr)? {
+            return Ok(r)
+        }
+        Ok(self.footer_cache.put(
+            self.get_data_ref::<CompactFooter>(ptr, CompactFooter::MSIZE)?,
+        ))
+    }
+
     fn del_desc(
         &mut self, desc_addr: ObjPtr<CompactDescriptor>,
     ) -> Result<(), ShaleError> {
@@ -321,10 +346,7 @@ impl<T: MummyItem> CompactSpaceInner<T> {
                 ObjPtr::new_from_addr(desc_addr.addr)
             })?;
             desc.write(|r| *r = *desc_last);
-            let mut header = self.get_data_ref::<CompactHeader>(
-                ObjPtr::new(desc.haddr),
-                CompactHeader::MSIZE,
-            )?;
+            let mut header = self.get_header(ObjPtr::new(desc.haddr))?;
             header.write(|h| h.desc_addr = desc_addr);
         }
         Ok(())
@@ -345,10 +367,7 @@ impl<T: MummyItem> CompactSpaceInner<T> {
 
         let mut offset = addr - hsize;
         let header_payload_size = {
-            let header = self.get_data_ref::<CompactHeader>(
-                ObjPtr::new(offset),
-                CompactHeader::MSIZE,
-            )?;
+            let header = self.get_header(ObjPtr::new(offset))?;
             assert!(!header.is_freed);
             header.payload_size
         };
@@ -359,15 +378,9 @@ impl<T: MummyItem> CompactSpaceInner<T> {
             // merge with lower data segment
             offset -= fsize;
             let (pheader_is_freed, pheader_payload_size, pheader_desc_addr) = {
-                let pfooter = self.get_data_ref::<CompactFooter>(
-                    ObjPtr::new(offset),
-                    CompactFooter::MSIZE,
-                )?;
+                let pfooter = self.get_footer(ObjPtr::new(offset))?;
                 offset -= pfooter.payload_size + hsize;
-                let pheader = self.get_data_ref::<CompactHeader>(
-                    ObjPtr::new(offset),
-                    CompactHeader::MSIZE,
-                )?;
+                let pheader = self.get_header(ObjPtr::new(offset))?;
                 (pheader.is_freed, pheader.payload_size, pheader.desc_addr)
             };
             if pheader_is_freed {
@@ -386,20 +399,14 @@ impl<T: MummyItem> CompactSpaceInner<T> {
             // merge with higher data segment
             offset += fsize;
             let (nheader_is_freed, nheader_payload_size, nheader_desc_addr) = {
-                let nheader = self.get_data_ref::<CompactHeader>(
-                    ObjPtr::new(offset),
-                    CompactHeader::MSIZE,
-                )?;
+                let nheader = self.get_header(ObjPtr::new(offset))?;
                 (nheader.is_freed, nheader.payload_size, nheader.desc_addr)
             };
             if nheader_is_freed {
                 offset += hsize + nheader_payload_size;
                 f = offset;
                 {
-                    let nfooter = self.get_data_ref::<CompactFooter>(
-                        ObjPtr::new(offset),
-                        CompactFooter::MSIZE,
-                    )?;
+                    let nfooter = self.get_footer(ObjPtr::new(offset))?;
                     assert!(nheader_payload_size == nfooter.payload_size);
                 }
                 payload_size += hsize + fsize + nheader_payload_size;
@@ -415,14 +422,8 @@ impl<T: MummyItem> CompactSpaceInner<T> {
                 d.haddr = h;
             });
         }
-        let mut h = self.get_data_ref::<CompactHeader>(
-            ObjPtr::new(h),
-            CompactHeader::MSIZE,
-        )?;
-        let mut f = self.get_data_ref::<CompactFooter>(
-            ObjPtr::new(f),
-            CompactFooter::MSIZE,
-        )?;
+        let mut h = self.get_header(ObjPtr::new(h))?;
+        let mut f = self.get_footer(ObjPtr::new(f))?;
         h.write(|h| {
             h.payload_size = payload_size;
             h.is_freed = true;
@@ -461,10 +462,8 @@ impl<T: MummyItem> CompactSpaceInner<T> {
             let exit = if desc_payload_size == length {
                 // perfect match
                 {
-                    let mut header = self.get_data_ref::<CompactHeader>(
-                        ObjPtr::new(desc_haddr),
-                        CompactHeader::MSIZE,
-                    )?;
+                    let mut header =
+                        self.get_header(ObjPtr::new(desc_haddr))?;
                     assert_eq!(header.payload_size, desc_payload_size);
                     assert!(header.is_freed);
                     header.write(|h| h.is_freed = false);
@@ -474,10 +473,8 @@ impl<T: MummyItem> CompactSpaceInner<T> {
             } else if desc_payload_size > length + hsize + fsize {
                 // able to split
                 {
-                    let mut lheader = self.get_data_ref::<CompactHeader>(
-                        ObjPtr::new(desc_haddr),
-                        CompactHeader::MSIZE,
-                    )?;
+                    let mut lheader =
+                        self.get_header(ObjPtr::new(desc_haddr))?;
                     assert_eq!(lheader.payload_size, desc_payload_size);
                     assert!(lheader.is_freed);
                     lheader.write(|h| {
@@ -486,10 +483,8 @@ impl<T: MummyItem> CompactSpaceInner<T> {
                     });
                 }
                 {
-                    let mut lfooter = self.get_data_ref::<CompactFooter>(
-                        ObjPtr::new(desc_haddr + hsize + length),
-                        CompactFooter::MSIZE,
-                    )?;
+                    let mut lfooter = self
+                        .get_footer(ObjPtr::new(desc_haddr + hsize + length))?;
                     //assert!(lfooter.payload_size == desc_payload_size);
                     lfooter.write(|f| f.payload_size = length);
                 }
@@ -505,10 +500,7 @@ impl<T: MummyItem> CompactSpaceInner<T> {
                     });
                 }
                 {
-                    let mut rheader = self.get_data_ref::<CompactHeader>(
-                        ObjPtr::new(offset),
-                        CompactHeader::MSIZE,
-                    )?;
+                    let mut rheader = self.get_header(ObjPtr::new(offset))?;
                     rheader.write(|rh| {
                         rh.is_freed = true;
                         rh.payload_size = rpayload_size;
@@ -516,10 +508,9 @@ impl<T: MummyItem> CompactSpaceInner<T> {
                     });
                 }
                 {
-                    let mut rfooter = self.get_data_ref::<CompactFooter>(
-                        ObjPtr::new(offset + hsize + rpayload_size),
-                        CompactFooter::MSIZE,
-                    )?;
+                    let mut rfooter = self.get_footer(ObjPtr::new(
+                        offset + hsize + rpayload_size,
+                    ))?;
                     rfooter.write(|f| f.payload_size = rpayload_size);
                 }
                 self.del_desc(ptr)?;
@@ -556,14 +547,9 @@ impl<T: MummyItem> CompactSpaceInner<T> {
             }
             **r += total_length
         });
-        let mut h = self.get_data_ref::<CompactHeader>(
-            ObjPtr::new(offset),
-            CompactHeader::MSIZE,
-        )?;
-        let mut f = self.get_data_ref::<CompactFooter>(
-            ObjPtr::new(offset + CompactHeader::MSIZE + length),
-            CompactFooter::MSIZE,
-        )?;
+        let mut h = self.get_header(ObjPtr::new(offset))?;
+        let mut f = self
+            .get_footer(ObjPtr::new(offset + CompactHeader::MSIZE + length))?;
         h.write(|h| {
             h.payload_size = length;
             h.is_freed = false;
@@ -590,6 +576,8 @@ impl<T: MummyItem> CompactSpace<T> {
                 compact_space,
                 header: CompactSpaceHeader::into_fields(header)?,
                 obj_cache,
+                header_cache: ObjCache::new(1024),
+                footer_cache: ObjCache::new(1024),
                 alloc_max_walk,
                 regn_nbit,
             }),
@@ -640,10 +628,9 @@ impl<T: MummyItem + 'static> ShaleStore<T> for CompactSpace<T> {
         if let Some(r) = inner.obj_cache.get(ptr)? {
             return Ok(r)
         }
-        let h = inner.get_data_ref::<CompactHeader>(
-            ObjPtr::new(ptr.addr() - CompactHeader::MSIZE),
-            CompactHeader::MSIZE,
-        )?;
+        println!("get_item {:x}", ptr.addr());
+        let h =
+            inner.get_header(ObjPtr::new(ptr.addr() - CompactHeader::MSIZE))?;
         Ok(inner
             .obj_cache
             .put(inner.get_data_ref(ptr, h.payload_size)?))

@@ -39,13 +39,15 @@ impl std::fmt::Debug for DiskWrite {
     }
 }
 
-/// A handle that pins and provides a readable access to a portion of the linear memory image.
-pub trait MemView: Deref<Target = [u8]> {
+pub trait MemInterval {
     /// Returns the underlying linear in-memory store.
     fn mem_image(&self) -> &dyn MemStore;
     /// Get the interval (offset, length).
     fn get_interval(&self) -> (u64, u64);
 }
+
+/// A handle that pins and provides a readable access to a portion of the linear memory image.
+pub trait MemView: Deref<Target = [u8]> {}
 
 /// In-memory store that offers access to intervals from a linear byte space, which is usually
 /// backed by a cached/memory-mapped pool of the accessed intervals from the underlying linear
@@ -55,6 +57,10 @@ pub trait MemStore {
     /// Returns a handle that pins the `length` of bytes starting from `offset` and makes them
     /// directly accessible.
     fn get_view(&self, offset: u64, length: u64) -> Option<Box<dyn MemView>>;
+    /// Returns a handle that pins the `length` of bytes starting from `offset`.
+    fn get_interval(
+        &self, offset: u64, length: u64,
+    ) -> Option<Box<dyn MemInterval>>;
     /// Write the `change` to the portion of the linear space starting at `offset`. The change
     /// should be immediately visible to all `MemView` associated to this linear space.
     fn write(&self, offset: u64, change: &[u8]);
@@ -124,8 +130,8 @@ impl<T: ?Sized> ObjPtr<T> {
 /// represents the decoded/mapped data. The implementation of [ShaleStore] could use [ObjCache] to
 /// turn a `TypedView` into an [ObjRef].
 pub trait TypedView<T: ?Sized>: Deref<Target = T> {
-    /// Access it as a [MemView] object.
-    fn as_mem_view(&self) -> &dyn MemView;
+    /// Access it as a [MemInterval] object.
+    fn as_mem_interval(&self) -> &dyn MemInterval;
     /// Defines how the current in-memory object of `T` should be represented in the linear storage space.
     fn to_mem_image(&self) -> Option<Box<[u8]>>;
     /// Write to the typed content.
@@ -144,7 +150,7 @@ pub struct Obj<T: ?Sized>(Box<dyn TypedView<T>>);
 impl<T: ?Sized> Obj<T> {
     #[inline(always)]
     pub fn as_ptr(&self) -> ObjPtr<T> {
-        ObjPtr::<T>::new(self.0.as_mem_view().get_interval().0)
+        ObjPtr::<T>::new(self.0.as_mem_interval().get_interval().0)
     }
 }
 
@@ -153,17 +159,18 @@ impl<T: ?Sized> Obj<T> {
     #[inline]
     pub fn write(&mut self, modify: impl FnOnce(&mut T) -> ()) -> Option<()> {
         modify(self.0.write());
-        let lspace = self.0.as_mem_view().mem_image();
+        let interval = self.0.as_mem_interval();
+        let lspace = interval.mem_image();
         let new_value = self.0.to_mem_image()?;
         if !self.0.is_mem_mapped() {
-            lspace.write(self.0.as_mem_view().get_interval().0, &new_value);
+            lspace.write(interval.get_interval().0, &new_value);
         }
         Some(())
     }
 
     #[inline(always)]
     pub fn get_space_id(&self) -> SpaceID {
-        self.0.as_mem_view().mem_image().id()
+        self.0.as_mem_interval().mem_image().id()
     }
 
     #[inline(always)]
@@ -251,7 +258,7 @@ pub trait MummyItem {
 /// should be useful for most applications.
 pub struct MummyObj<T> {
     decoded: T,
-    raw: Box<dyn MemView>,
+    raw: Box<dyn MemInterval>,
     len_limit: u64,
 }
 
@@ -263,7 +270,7 @@ impl<T> Deref for MummyObj<T> {
 }
 
 impl<T: MummyItem> TypedView<T> for MummyObj<T> {
-    fn as_mem_view(&self) -> &dyn MemView {
+    fn as_mem_interval(&self) -> &dyn MemInterval {
         &*self.raw
     }
     fn to_mem_image(&self) -> Option<Box<[u8]>> {
@@ -291,7 +298,7 @@ impl<T: MummyItem + 'static> MummyObj<T> {
         Ok(Self {
             decoded,
             raw: space
-                .get_view(addr, length)
+                .get_interval(addr, length)
                 .ok_or(ShaleError::LinearMemStoreError)?,
             len_limit,
         })
@@ -305,7 +312,7 @@ impl<T: MummyItem + 'static> MummyObj<T> {
         Ok(Self {
             decoded,
             raw: space
-                .get_view(addr, length)
+                .get_interval(addr, length)
                 .ok_or(ShaleError::LinearMemStoreError)?,
             len_limit,
         })
@@ -340,7 +347,7 @@ impl<T> MummyObj<T> {
         Ok(Self {
             decoded,
             raw: space
-                .get_view(addr, length)
+                .get_interval(addr, length)
                 .ok_or(ShaleError::LinearMemStoreError)?,
             len_limit,
         })
@@ -349,13 +356,14 @@ impl<T> MummyObj<T> {
     pub unsafe fn slice<U: MummyItem + 'static>(
         s: &Obj<T>, offset: u64, length: u64, decoded: U,
     ) -> Result<Obj<U>, ShaleError> {
-        let addr_ = s.0.as_mem_view().get_interval().0 + offset;
+        let interval = s.0.as_mem_interval();
+        let addr_ = interval.get_interval().0 + offset;
         let r = Box::new(MummyObj::new_from_slice(
             addr_,
             length,
             length,
             decoded,
-            s.0.as_mem_view().mem_image(),
+            interval.mem_image(),
         )?);
         Ok(Obj(r))
     }
@@ -399,13 +407,7 @@ impl PlainMem {
         let space = Rc::new(UnsafeCell::new(space));
         Self { space, id }
     }
-    fn get_space_mut(&self) -> &mut Vec<u8> {
-        unsafe { &mut *self.space.get() }
-    }
-}
-
-impl MemStore for PlainMem {
-    fn get_view(&self, offset: u64, length: u64) -> Option<Box<dyn MemView>> {
+    fn get_view_(&self, offset: u64, length: u64) -> Option<Box<PlainMemRef>> {
         let offset = offset as usize;
         let length = length as usize;
         if offset + length > self.get_space_mut().len() {
@@ -420,6 +422,21 @@ impl MemStore for PlainMem {
                 },
             }))
         }
+    }
+    fn get_space_mut(&self) -> &mut Vec<u8> {
+        unsafe { &mut *self.space.get() }
+    }
+}
+
+impl MemStore for PlainMem {
+    fn get_view(&self, offset: u64, length: u64) -> Option<Box<dyn MemView>> {
+        Some(self.get_view_(offset, length)?)
+    }
+
+    fn get_interval(
+        &self, offset: u64, length: u64,
+    ) -> Option<Box<dyn MemInterval>> {
+        Some(self.get_view_(offset, length)?)
     }
 
     fn write(&self, offset: u64, change: &[u8]) {
@@ -446,7 +463,7 @@ impl Deref for PlainMemRef {
     }
 }
 
-impl MemView for PlainMemRef {
+impl MemInterval for PlainMemRef {
     fn mem_image(&self) -> &dyn MemStore {
         &self.mem
     }
@@ -454,6 +471,8 @@ impl MemView for PlainMemRef {
         (self.offset as u64, self.length as u64)
     }
 }
+
+impl MemView for PlainMemRef {}
 
 /// [ObjRef] pool that is used by [ShaleStore] implementation to construct [ObjRef]s.
 pub struct ObjCache<T: ?Sized>(
