@@ -14,7 +14,8 @@ pub mod util;
 pub enum ShaleError {
     LinearMemStoreError,
     DecodeError,
-    ObjRefError,
+    ObjRefAlreadyInUse,
+    ObjPtrInvalid,
     SliceError,
 }
 
@@ -551,7 +552,7 @@ impl<T> ObjCache<T> {
         let inner = &mut self.get_inner_mut();
         if let Some(r) = inner.cached.pop(&ptr) {
             if inner.pinned.insert(ptr, false).is_some() {
-                return Err(ShaleError::ObjRefError)
+                return Err(ShaleError::ObjRefAlreadyInUse)
             }
             return Ok(Some(ObjRef {
                 inner: Some(r),
