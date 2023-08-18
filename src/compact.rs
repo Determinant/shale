@@ -584,9 +584,7 @@ impl<T: MummyItem> CompactSpace<T> {
 }
 
 impl<T: MummyItem + 'static> ShaleStore<T> for CompactSpace<T> {
-    fn put_item<'a>(
-        &'a self, item: T, extra: u64,
-    ) -> Result<ObjRef<'a, T>, ShaleError> {
+    fn put_item(&self, item: T, extra: u64) -> Result<ObjRef<T>, ShaleError> {
         let size = item.dehydrated_len() + extra;
         let inner = unsafe { &mut *self.inner.get() };
         let ptr: ObjPtr<T> = unsafe {
@@ -616,9 +614,7 @@ impl<T: MummyItem + 'static> ShaleStore<T> for CompactSpace<T> {
         inner.free(ptr.addr())
     }
 
-    fn get_item<'a>(
-        &'a self, ptr: ObjPtr<T>,
-    ) -> Result<ObjRef<'a, T>, ShaleError> {
+    fn get_item(&self, ptr: ObjPtr<T>) -> Result<ObjRef<T>, ShaleError> {
         let inner = unsafe { &*self.inner.get() };
         if let Some(r) = inner.obj_cache.get(ptr)? {
             return Ok(r)

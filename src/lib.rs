@@ -1,3 +1,4 @@
+use parking_lot::Mutex;
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -5,6 +6,7 @@ use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub mod block;
 pub mod compact;
@@ -205,42 +207,33 @@ impl<T> Deref for Obj<T> {
 }
 
 /// User handle that offers read & write access to the stored [ShaleStore] item.
-pub struct ObjRef<'a, T> {
+pub struct ObjRef<T> {
     inner: Option<Obj<T>>,
     cache: ObjCache<T>,
-    _life: PhantomData<&'a mut ()>,
 }
 
-impl<'a, T> ObjRef<'a, T> {
-    pub unsafe fn to_longlive(mut self) -> ObjRef<'static, T> {
-        ObjRef {
-            inner: self.inner.take(),
-            cache: ObjCache(self.cache.0.clone()),
-            _life: PhantomData,
-        }
-    }
-
+impl<T> ObjRef<T> {
     #[inline]
     pub fn write(&mut self, modify: impl FnOnce(&mut T) -> ()) -> Option<()> {
         let inner = self.inner.as_mut().unwrap();
         inner.write(modify)?;
-        self.cache.get_inner_mut().dirty.insert(inner.as_ptr());
+        self.cache.0.lock().dirty.insert(inner.as_ptr());
         Some(())
     }
 }
 
-impl<'a, T> Deref for ObjRef<'a, T> {
+impl<T> Deref for ObjRef<T> {
     type Target = Obj<T>;
     fn deref(&self) -> &Obj<T> {
         self.inner.as_ref().unwrap()
     }
 }
 
-impl<'a, T> Drop for ObjRef<'a, T> {
+impl<T> Drop for ObjRef<T> {
     fn drop(&mut self) {
         let mut inner = self.inner.take().unwrap();
         let ptr = inner.as_ptr();
-        let cache = self.cache.get_inner_mut();
+        let mut cache = self.cache.0.lock();
         if cache.pinned.remove(&ptr).unwrap() {
             inner.dirty = None;
         } else {
@@ -253,13 +246,11 @@ impl<'a, T> Drop for ObjRef<'a, T> {
 /// items could be retrieved or dropped.
 pub trait ShaleStore<T> {
     /// Dereference [ObjPtr] to a unique handle that allows direct access to the item in memory.
-    fn get_item<'a>(
-        &'a self, ptr: ObjPtr<T>,
-    ) -> Result<ObjRef<'a, T>, ShaleError>;
+    fn get_item<'a>(&'a self, ptr: ObjPtr<T>) -> Result<ObjRef<T>, ShaleError>;
     /// Allocate a new item.
     fn put_item<'a>(
         &'a self, item: T, extra: u64,
-    ) -> Result<ObjRef<'a, T>, ShaleError>;
+    ) -> Result<ObjRef<T>, ShaleError>;
     /// Free an item and recycle its space when applicable.
     fn free_item(&mut self, item: ObjPtr<T>) -> Result<(), ShaleError>;
     /// Flush all dirty writes.
@@ -527,11 +518,11 @@ struct ObjCacheInner<T: ?Sized> {
 }
 
 /// [ObjRef] pool that is used by [ShaleStore] implementation to construct [ObjRef]s.
-pub struct ObjCache<T: ?Sized>(Rc<UnsafeCell<ObjCacheInner<T>>>);
+pub struct ObjCache<T: ?Sized>(Arc<Mutex<ObjCacheInner<T>>>);
 
 impl<T> ObjCache<T> {
     pub fn new(capacity: usize) -> Self {
-        Self(Rc::new(UnsafeCell::new(ObjCacheInner {
+        Self(Arc::new(Mutex::new(ObjCacheInner {
             cached: lru::LruCache::new(
                 NonZeroUsize::new(capacity).expect("non-zero cache size"),
             ),
@@ -541,15 +532,8 @@ impl<T> ObjCache<T> {
     }
 
     #[inline(always)]
-    fn get_inner_mut(&self) -> &mut ObjCacheInner<T> {
-        unsafe { &mut *self.0.get() }
-    }
-
-    #[inline(always)]
-    pub fn get<'a>(
-        &'a self, ptr: ObjPtr<T>,
-    ) -> Result<Option<ObjRef<'a, T>>, ShaleError> {
-        let inner = &mut self.get_inner_mut();
+    pub fn get(&self, ptr: ObjPtr<T>) -> Result<Option<ObjRef<T>>, ShaleError> {
+        let inner = &mut self.0.lock();
         if let Some(r) = inner.cached.pop(&ptr) {
             if inner.pinned.insert(ptr, false).is_some() {
                 return Err(ShaleError::ObjRefAlreadyInUse)
@@ -557,26 +541,24 @@ impl<T> ObjCache<T> {
             return Ok(Some(ObjRef {
                 inner: Some(r),
                 cache: Self(self.0.clone()),
-                _life: PhantomData,
             }))
         }
         Ok(None)
     }
 
     #[inline(always)]
-    pub fn put<'a>(&'a self, inner: Obj<T>) -> ObjRef<'a, T> {
+    pub fn put(&self, inner: Obj<T>) -> ObjRef<T> {
         let ptr = inner.as_ptr();
-        self.get_inner_mut().pinned.insert(ptr, false);
+        self.0.lock().pinned.insert(ptr, false);
         ObjRef {
             inner: Some(inner),
             cache: Self(self.0.clone()),
-            _life: PhantomData,
         }
     }
 
     #[inline(always)]
     pub fn pop(&self, ptr: ObjPtr<T>) {
-        let inner = self.get_inner_mut();
+        let mut inner = self.0.lock();
         if let Some(f) = inner.pinned.get_mut(&ptr) {
             *f = true
         }
@@ -587,7 +569,7 @@ impl<T> ObjCache<T> {
     }
 
     pub fn flush_dirty(&self) -> Option<()> {
-        let inner = self.get_inner_mut();
+        let mut inner = self.0.lock();
         if !inner.pinned.is_empty() {
             return None
         }

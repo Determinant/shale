@@ -10,3 +10,4 @@ license = "MIT"
 [dependencies]
 hex = "0.4.3"
 lru = "0.8.1"
+parking_lot = "0.12.1"
