@@ -1,6 +1,6 @@
 [package]
 name = "shale"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 description = "Useful abstraction and light-weight implemenation for a key-value store."
 license = "MIT"
@@ -9,5 +9,5 @@ license = "MIT"
 
 [dependencies]
 hex = "0.4.3"
-lru = "0.8.1"
+lru = "0.12.2"
 parking_lot = "0.12.1"
